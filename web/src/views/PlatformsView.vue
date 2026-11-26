@@ -456,7 +456,7 @@
       v-model:show="showEndpointModal"
       preset="card"
       :title="editingEndpoint ? `编辑接口：${editingEndpoint.code}` : '新增 API 接口'"
-      style="width: 540px"
+      style="width: 640px"
     >
       <n-form label-placement="top">
         <n-grid :cols="2" :x-gap="12">
@@ -492,8 +492,13 @@
           v-if="!editingEndpoint || editingEndpoint.resource_type === 'http_endpoint'"
           label="路径模板 (Path Pattern)"
           required
+          feedback="相对平台 Base URL，不含 ?query；支持 {id} 路径参数、* 与 ** 通配"
         >
-          <n-input v-model:value="epForm.path_pattern" placeholder="例如 /api/v1/customers 或 /api/v1/issue/{key}" />
+          <n-input
+            v-model:value="epForm.path_pattern"
+            class="mono-code"
+            placeholder="例如 /api/v1/customers 或 /api/v1/issue/{key}"
+          />
         </n-form-item>
         <n-form-item v-if="epForm.expose_as_mcp" label="MCP Tool 名称（留空默认 {platform}_{code}）">
           <n-input v-model:value="epForm.mcp_tool_name" placeholder="例如 crm_list_customers" />
@@ -501,8 +506,14 @@
         <n-form-item label="描述（供 AI 理解工具用途）">
           <n-input v-model:value="epForm.description" />
         </n-form-item>
-        <n-form-item label="入参 JSON Schema">
-          <n-input v-model:value="epForm.inputSchemaJson" type="textarea" :rows="3" class="mono-code" />
+        <n-form-item :show-label="false">
+          <JsonSchemaParamsEditor
+            v-model="epForm.input_schema"
+            :path-pattern="epForm.path_pattern"
+            :http-method="epForm.method"
+            :is-mcp-tool="editingEndpoint?.resource_type === 'mcp_tool'"
+            @valid-change="epInputSchemaValid = $event"
+          />
         </n-form-item>
         <n-form-item label="启用状态" label-placement="left">
           <n-switch v-model:value="epForm.is_active" />
@@ -547,6 +558,7 @@ import {
   type DataTableColumns,
 } from "naive-ui";
 import { apiRequest } from "@/api/client";
+import JsonSchemaParamsEditor from "@/components/JsonSchemaParamsEditor.vue";
 import TokenInvalidRulesEditor, {
   type TokenInvalidRulesValue,
 } from "@/components/TokenInvalidRulesEditor.vue";
@@ -645,6 +657,7 @@ const showEndpointModal = ref(false);
 const editingEndpoint = ref<PlatformEndpoint | null>(null);
 const savingEndpoint = ref(false);
 const syncingMcp = ref(false);
+const epInputSchemaValid = ref(true);
 const epForm = reactive({
   code: "",
   name: "",
@@ -653,7 +666,7 @@ const epForm = reactive({
   path_pattern: "",
   expose_as_mcp: true,
   mcp_tool_name: "",
-  inputSchemaJson: '{"type": "object", "properties": {}}',
+  input_schema: { type: "object", properties: {} } as Record<string, unknown>,
   is_active: true,
 });
 
@@ -1121,6 +1134,7 @@ function openEndpointsDrawer(row: PlatformItem) {
 
 function openCreateEndpoint() {
   editingEndpoint.value = null;
+  epInputSchemaValid.value = true;
   Object.assign(epForm, {
     code: "",
     name: "",
@@ -1129,7 +1143,7 @@ function openCreateEndpoint() {
     path_pattern: "",
     expose_as_mcp: true,
     mcp_tool_name: "",
-    inputSchemaJson: '{"type": "object", "properties": {}}',
+    input_schema: { type: "object", properties: {} },
     is_active: true,
   });
   showEndpointModal.value = true;
@@ -1137,6 +1151,7 @@ function openCreateEndpoint() {
 
 function openEditEndpoint(ep: PlatformEndpoint) {
   editingEndpoint.value = ep;
+  epInputSchemaValid.value = true;
   Object.assign(epForm, {
     code: ep.code,
     name: ep.name,
@@ -1145,7 +1160,7 @@ function openEditEndpoint(ep: PlatformEndpoint) {
     path_pattern: ep.path_pattern || "",
     expose_as_mcp: ep.expose_as_mcp,
     mcp_tool_name: ep.mcp_tool_name || "",
-    inputSchemaJson: JSON.stringify(ep.input_schema || { type: "object", properties: {} }, null, 2),
+    input_schema: JSON.parse(JSON.stringify(ep.input_schema || { type: "object", properties: {} })),
     is_active: ep.is_active,
   });
   showEndpointModal.value = true;
@@ -1153,13 +1168,11 @@ function openEditEndpoint(ep: PlatformEndpoint) {
 
 async function handleSaveEndpoint() {
   if (!activePlatform.value) return;
-  let schemaObj: Record<string, unknown> = {};
-  try {
-    schemaObj = JSON.parse(epForm.inputSchemaJson || "{}");
-  } catch {
-    message.error("入参 JSON Schema 格式错误");
+  if (!epInputSchemaValid.value) {
+    message.error("入参 JSON Schema 格式不正确，请先修正");
     return;
   }
+  const schemaObj = epForm.input_schema || { type: "object", properties: {} };
   savingEndpoint.value = true;
   try {
     if (editingEndpoint.value) {
