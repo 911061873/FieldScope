@@ -1,0 +1,49 @@
+[project]
+name = "fieldscope"
+version = "0.1.0"
+description = "面向企业的细粒度数据连接器，为第三方系统接入与 AI 调用提供用户级的数据范围与字段级权限管控。"
+readme = "README.md"
+authors = [
+    { name = "Peng1013", email = "19637526+911061873@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "cryptography>=50.0.2",
+    "fastapi>=0.165.0",
+    "httpx>=0.28.1",
+    "mcp>=2.3.0",
+    "pydantic-settings>=2.16.3",
+    "pyjwt>=2.15.1",
+    "sqlalchemy[asyncio]>=2.1.9",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+fieldscope = "fieldscope:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+    "ruff>=0.17.6",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
