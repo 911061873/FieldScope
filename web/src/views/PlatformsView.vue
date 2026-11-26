@@ -222,13 +222,10 @@
                     </n-form-item>
                   </n-gi>
                 </n-grid>
-                <n-form-item label="响应体 Token 失效规则 JSON（可选，除 HTTP 401 外触发刷新重放）">
-                  <n-input
-                    v-model:value="oauthForm.bodyRulesJson"
-                    type="textarea"
-                    :rows="2"
-                    class="mono-code"
-                    placeholder='[{"path": "$.code", "in_values": [40001, 42001]}]'
+                <n-form-item :show-label="false">
+                  <TokenInvalidRulesEditor
+                    v-model="oauthForm.invalid_rules"
+                    @valid-change="oauthInvalidRulesValid = $event"
                   />
                 </n-form-item>
               </template>
@@ -317,13 +314,10 @@
                     </n-form-item>
                   </n-gi>
                 </n-grid>
-                <n-form-item label="响应体失效判定规则 JSON（如 HTTP 200 返回错误码时自动刷新重放）">
-                  <n-input
-                    v-model:value="customForm.bodyRulesJson"
-                    type="textarea"
-                    :rows="2"
-                    class="mono-code"
-                    placeholder='[{"path": "$.code", "in_values": [40001]}]'
+                <n-form-item :show-label="false">
+                  <TokenInvalidRulesEditor
+                    v-model="customForm.invalid_rules"
+                    @valid-change="customInvalidRulesValid = $event"
                   />
                 </n-form-item>
               </template>
@@ -553,6 +547,9 @@ import {
   type DataTableColumns,
 } from "naive-ui";
 import { apiRequest } from "@/api/client";
+import TokenInvalidRulesEditor, {
+  type TokenInvalidRulesValue,
+} from "@/components/TokenInvalidRulesEditor.vue";
 import type {
   PlatformAuthConfigRead,
   PlatformAuthTestResult,
@@ -590,6 +587,8 @@ const activePlatform = ref<PlatformItem | null>(null);
 const savingAuth = ref(false);
 const authType = ref<"none" | "static" | "oauth2" | "custom_http">("none");
 const loadedAuthConfig = ref<Record<string, any> | null>(null);
+const oauthInvalidRulesValid = ref(true);
+const customInvalidRulesValid = ref(true);
 
 const staticForm = reactive({
   location: "header" as "header" | "query",
@@ -611,7 +610,7 @@ const oauthForm = reactive({
   inject_name: "Authorization",
   inject_prefix: "Bearer ",
   refresh_leeway_seconds: 60,
-  bodyRulesJson: "[]",
+  invalid_rules: { http_statuses: [401], body_rules: [] } as TokenInvalidRulesValue,
 });
 
 const customForm = reactive({
@@ -627,7 +626,7 @@ const customForm = reactive({
   inject_name: "Authorization",
   inject_prefix: "Bearer ",
   refresh_leeway_seconds: 60,
-  bodyRulesJson: "[]",
+  invalid_rules: { http_statuses: [401], body_rules: [] } as TokenInvalidRulesValue,
 });
 
 const tokenStatus = ref<PlatformTokenStatus | null>(null);
@@ -877,6 +876,10 @@ async function openAuthDrawer(row: PlatformItem) {
   oauthCodeInput.value = "";
   testResult.value = null;
   loadedAuthConfig.value = null;
+  oauthInvalidRulesValid.value = true;
+  customInvalidRulesValid.value = true;
+  oauthForm.invalid_rules = { http_statuses: [401], body_rules: [] };
+  customForm.invalid_rules = { http_statuses: [401], body_rules: [] };
 
   try {
     const cfg = await apiRequest<PlatformAuthConfigRead>(`/api/v1/admin/platforms/${row.id}/auth`);
@@ -904,7 +907,14 @@ async function openAuthDrawer(row: PlatformItem) {
         inject_name: c.inject_name || "Authorization",
         inject_prefix: c.inject_prefix ?? "Bearer ",
         refresh_leeway_seconds: c.refresh_leeway_seconds ?? 60,
-        bodyRulesJson: JSON.stringify(c.invalid_rules?.body_rules || [], null, 2),
+        invalid_rules: {
+          http_statuses: Array.isArray(c.invalid_rules?.http_statuses)
+            ? [...c.invalid_rules.http_statuses]
+            : [401],
+          body_rules: Array.isArray(c.invalid_rules?.body_rules)
+            ? JSON.parse(JSON.stringify(c.invalid_rules.body_rules))
+            : [],
+        },
       });
     } else if (cfg.auth_type === "custom_http") {
       Object.assign(customForm, {
@@ -920,7 +930,14 @@ async function openAuthDrawer(row: PlatformItem) {
         inject_name: c.inject_name || "Authorization",
         inject_prefix: c.inject_prefix ?? "Bearer ",
         refresh_leeway_seconds: c.refresh_leeway_seconds ?? 60,
-        bodyRulesJson: JSON.stringify(c.invalid_rules?.body_rules || [], null, 2),
+        invalid_rules: {
+          http_statuses: Array.isArray(c.invalid_rules?.http_statuses)
+            ? [...c.invalid_rules.http_statuses]
+            : [401],
+          body_rules: Array.isArray(c.invalid_rules?.body_rules)
+            ? JSON.parse(JSON.stringify(c.invalid_rules.body_rules))
+            : [],
+        },
       });
     }
     await loadTokenStatus();
@@ -938,6 +955,14 @@ async function loadTokenStatus() {
 
 async function handleSaveAuth() {
   if (!activePlatform.value) return;
+  if (
+    (authType.value === "oauth2" && !oauthInvalidRulesValid.value) ||
+    (authType.value === "custom_http" && !customInvalidRulesValid.value)
+  ) {
+    message.error("Token 失效判定规则 JSON 格式不正确，请先修正");
+    return;
+  }
+
   let payload: Record<string, unknown> = { auth_type: "none" };
   const prev =
     loadedAuthConfig.value && loadedAuthConfig.value.auth_type === authType.value
@@ -948,7 +973,6 @@ async function handleSaveAuth() {
     if (authType.value === "static") {
       payload = { ...prev, auth_type: "static", ...staticForm };
     } else if (authType.value === "oauth2") {
-      const bodyRules = JSON.parse(oauthForm.bodyRulesJson || "[]");
       payload = {
         ...prev,
         auth_type: "oauth2",
@@ -965,14 +989,13 @@ async function handleSaveAuth() {
         inject_prefix: oauthForm.inject_prefix,
         refresh_leeway_seconds: oauthForm.refresh_leeway_seconds,
         invalid_rules: {
-          ...(prev.invalid_rules || { http_statuses: [401] }),
-          body_rules: bodyRules,
+          http_statuses: oauthForm.invalid_rules.http_statuses,
+          body_rules: oauthForm.invalid_rules.body_rules,
         },
       };
     } else if (authType.value === "custom_http") {
       const bodyObj = JSON.parse(customForm.bodyJson || "{}");
       const secretsObj = JSON.parse(customForm.secretsJson || "{}");
-      const bodyRules = JSON.parse(customForm.bodyRulesJson || "[]");
       payload = {
         ...prev,
         auth_type: "custom_http",
@@ -995,8 +1018,8 @@ async function handleSaveAuth() {
         inject_prefix: customForm.inject_prefix,
         refresh_leeway_seconds: customForm.refresh_leeway_seconds,
         invalid_rules: {
-          ...(prev.invalid_rules || { http_statuses: [401] }),
-          body_rules: bodyRules,
+          http_statuses: customForm.invalid_rules.http_statuses,
+          body_rules: customForm.invalid_rules.body_rules,
         },
       };
     }
