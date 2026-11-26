@@ -1,0 +1,35 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  apps/gateway:
+    dependencies:
+      '@fieldscope/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@fieldscope/field-engine':
+        specifier: workspace:*
+        version: link:../../packages/field-engine
+      '@fieldscope/policy-engine':
+        specifier: workspace:*
+        version: link:../../packages/policy-engine
+
+  packages/core: {}
+
+  packages/field-engine:
+    dependencies:
+      '@fieldscope/core':
+        specifier: workspace:*
+        version: link:../core
+
+  packages/policy-engine:
+    dependencies:
+      '@fieldscope/core':
+        specifier: workspace:*
+        version: link:../core

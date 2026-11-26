@@ -1,0 +1,15 @@
+{
+  "name": "@fieldscope/gateway",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "node src/index.ts --config ../../examples/fieldscope.json",
+    "start": "node src/index.ts"
+  },
+  "dependencies": {
+    "@fieldscope/core": "workspace:*",
+    "@fieldscope/field-engine": "workspace:*",
+    "@fieldscope/policy-engine": "workspace:*"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "fieldscope",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Enterprise AI API permission middleware with endpoint, parameter, and field-level governance",
+  "type": "module",
+  "scripts": {
+    "test": "node --test packages/*/test/*.test.ts apps/*/test/*.test.ts",
+    "dev:mock": "node examples/mock-upstream.ts",
+    "dev:gateway": "node apps/gateway/src/index.ts --config examples/fieldscope.json"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}
