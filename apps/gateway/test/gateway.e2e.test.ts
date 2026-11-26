@@ -284,4 +284,120 @@ describe("@fieldscope/gateway end-to-end", () => {
       await gateway.close();
     }
   });
+
+  it("serves governed MCP tools over POST /mcp with tools/list filtering and tools/call field pruning", async () => {
+    const config = buildConfig("header");
+    config.connectors[0].mcpTools = [
+      {
+        name: "jira_search_issues",
+        description: "Search Jira issues",
+        method: "GET",
+        path: "/rest/api/3/search",
+        inputSchema: { type: "object" },
+      },
+      {
+        name: "jira_delete_issue",
+        description: "Delete Jira issue",
+        method: "DELETE",
+        path: "/rest/api/3/issue/:key",
+        inputSchema: { type: "object" },
+      },
+    ];
+    config.policies.push({
+      id: "policy-mcp-jira-read",
+      effect: "allow",
+      priority: 100,
+      match: {
+        principal: {
+          roles: ["employee"],
+          attributes: { department: "engineering" },
+        },
+        connector: "jira-prod",
+      },
+      action: {
+        protocol: "mcp",
+        methods: ["*"],
+        paths: ["/**"],
+        tools: ["jira_search_*"],
+      },
+      request: {
+        validate: [],
+        enforce: { "args.project": "{{ principal.attributes.projectKey }}" },
+      },
+      response: {
+        mode: "allowlist",
+        fields: ["issues[*].key", "issues[*].fields.reporter.emailAddress"],
+        transforms: [
+          {
+            path: "issues[*].fields.reporter.emailAddress",
+            action: "mask_email",
+          },
+        ],
+      },
+    });
+
+    const gateway = createGatewayServer({
+      config,
+      auditSink: { record: () => {} },
+    });
+    const gwUrl = await gateway.listen("127.0.0.1", 0);
+
+    try {
+      const headers = {
+        "content-type": "application/json",
+        "x-fieldscope-user-id": "emp-007",
+        "x-fieldscope-roles": "employee",
+        "x-fieldscope-attributes": JSON.stringify({
+          department: "engineering",
+          projectKey: "ENG",
+        }),
+      };
+
+      // 1. tools/list only exposes jira_search_issues
+      const listRes = await fetch(`${gwUrl}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      assert.equal(listRes.status, 200);
+      const listBody = (await listRes.json()) as {
+        result: { tools: Array<{ name: string }> };
+      };
+      assert.deepEqual(
+        listBody.result.tools.map((t) => t.name),
+        ["jira_search_issues"]
+      );
+
+      // 2. tools/call enforces project=ENG and prunes/masks response
+      const callRes = await fetch(`${gwUrl}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "jira_search_issues",
+            arguments: { project: "FINANCE" },
+          },
+        }),
+      });
+      assert.equal(callRes.status, 200);
+      const callBody = (await callRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      assert.equal(callBody.result.isError, false);
+      assert.equal(lastUpstreamRequest?.query.project, "ENG");
+      assert.deepEqual(JSON.parse(callBody.result.content[0].text), {
+        issues: [
+          {
+            key: "ENG-42",
+            fields: { reporter: { emailAddress: "li***@enterprise.com" } },
+          },
+        ],
+      });
+    } finally {
+      await gateway.close();
+    }
+  });
 });

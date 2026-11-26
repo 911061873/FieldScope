@@ -16,13 +16,41 @@
       "auth": {
         "type": "bearer",
         "token": "${JIRA_API_TOKEN:-demo-jira-service-token}"
-      }
+      },
+      "mcpTools": [
+        {
+          "name": "jira_search_issues",
+          "description": "Search enterprise Jira issues scoped to the user's project",
+          "method": "GET",
+          "path": "/rest/api/3/search",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "project": { "type": "string", "description": "Jira project key" },
+              "maxResults": { "type": "number", "description": "Maximum issues to return (<= 50)" }
+            }
+          }
+        },
+        {
+          "name": "jira_delete_issue",
+          "description": "Permanently delete a Jira issue (admin only)",
+          "method": "DELETE",
+          "path": "/rest/api/3/issue/:issueKey",
+          "inputSchema": {
+            "type": "object",
+            "required": ["issueKey"],
+            "properties": {
+              "issueKey": { "type": "string" }
+            }
+          }
+        }
+      ]
     }
   ],
   "policies": [
     {
       "id": "policy-jira-eng-read",
-      "name": "Engineering Read Jira Issues",
+      "name": "Engineering Read Jira Issues (HTTP)",
       "effect": "allow",
       "priority": 100,
       "match": {
@@ -48,6 +76,57 @@
         ],
         "enforce": {
           "query.project": "{{ principal.attributes.projectKey }}"
+        }
+      },
+      "response": {
+        "mode": "allowlist",
+        "fields": [
+          "issues[*].key",
+          "issues[*].fields.summary",
+          "issues[*].fields.status.name",
+          "issues[*].fields.reporter.displayName",
+          "issues[*].fields.reporter.emailAddress",
+          "issues[*].fields.description"
+        ],
+        "transforms": [
+          {
+            "path": "issues[*].fields.reporter.emailAddress",
+            "action": "mask_email"
+          },
+          {
+            "path": "issues[*].fields.description",
+            "action": "redact_pii"
+          }
+        ]
+      }
+    },
+    {
+      "id": "policy-jira-eng-mcp-read",
+      "name": "Engineering Read Jira Issues (MCP)",
+      "effect": "allow",
+      "priority": 100,
+      "match": {
+        "principal": {
+          "roles": ["employee"],
+          "attributes": {
+            "department": "engineering"
+          }
+        },
+        "connector": "jira-prod"
+      },
+      "action": {
+        "protocol": "mcp",
+        "tools": ["jira_search_*"]
+      },
+      "request": {
+        "validate": [
+          {
+            "expr": "args.maxResults == null || args.maxResults <= 50",
+            "message": "单次最多查询 50 条工单（maxResults <= 50）"
+          }
+        ],
+        "enforce": {
+          "args.project": "{{ principal.attributes.projectKey }}"
         }
       },
       "response": {

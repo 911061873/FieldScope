@@ -16,9 +16,15 @@ importers:
       '@fieldscope/field-engine':
         specifier: workspace:*
         version: link:../../packages/field-engine
+      '@fieldscope/mcp-adapter':
+        specifier: workspace:*
+        version: link:../../packages/mcp-adapter
       '@fieldscope/policy-engine':
         specifier: workspace:*
         version: link:../../packages/policy-engine
+      '@fieldscope/vault':
+        specifier: workspace:*
+        version: link:../../packages/vault
 
   packages/core: {}
 
@@ -28,7 +34,28 @@ importers:
         specifier: workspace:*
         version: link:../core
 
+  packages/mcp-adapter:
+    dependencies:
+      '@fieldscope/core':
+        specifier: workspace:*
+        version: link:../core
+      '@fieldscope/field-engine':
+        specifier: workspace:*
+        version: link:../field-engine
+      '@fieldscope/policy-engine':
+        specifier: workspace:*
+        version: link:../policy-engine
+      '@fieldscope/vault':
+        specifier: workspace:*
+        version: link:../vault
+
   packages/policy-engine:
+    dependencies:
+      '@fieldscope/core':
+        specifier: workspace:*
+        version: link:../core
+
+  packages/vault:
     dependencies:
       '@fieldscope/core':
         specifier: workspace:*

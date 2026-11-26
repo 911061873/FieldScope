@@ -10,6 +10,8 @@
   "dependencies": {
     "@fieldscope/core": "workspace:*",
     "@fieldscope/field-engine": "workspace:*",
-    "@fieldscope/policy-engine": "workspace:*"
+    "@fieldscope/mcp-adapter": "workspace:*",
+    "@fieldscope/policy-engine": "workspace:*",
+    "@fieldscope/vault": "workspace:*"
   }
 }

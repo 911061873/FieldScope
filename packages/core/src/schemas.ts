@@ -22,7 +22,28 @@ export type ConnectorAuth =
   | { type: "bearer"; token: string }
   | { type: "header"; headerName: string; value: string }
   | { type: "query"; paramName: string; value: string }
-  | { type: "basic"; username: string; password: string };
+  | { type: "basic"; username: string; password: string }
+  | {
+      type: "oauth_delegated";
+      tokenUrl: string;
+      clientId: string;
+      clientSecret: string;
+      scope?: string;
+      fallbackAuth?: Exclude<ConnectorAuth, { type: "oauth_delegated" }>;
+    };
+
+export interface McpToolMapping {
+  name: string;
+  description: string;
+  method: Exclude<HttpMethod, "*">;
+  path: string;
+  inputSchema: Record<string, unknown>;
+  /**
+   * Maps tool argument names to where they should be placed in the HTTP request.
+   * Defaults to "query" for GET/HEAD/DELETE and "body" for POST/PUT/PATCH.
+   */
+  paramLocation?: Record<string, "path" | "query" | "body">;
+}
 
 export interface Connector {
   id: string;
@@ -31,6 +52,7 @@ export interface Connector {
   baseUrl: string;
   auth: ConnectorAuth;
   timeoutMs: number;
+  mcpTools?: McpToolMapping[];
 }
 
 export type FieldTransformAction =
@@ -96,12 +118,18 @@ export interface GatewayAuthConfig {
   headerPrefix: string;
 }
 
+export interface GatewayVaultConfig {
+  masterKey?: string;
+  sqlitePath?: string;
+}
+
 export interface GatewayConfig {
   server: {
     host: string;
     port: number;
   };
   auth: GatewayAuthConfig;
+  vault?: GatewayVaultConfig;
   connectors: Connector[];
   policies: Policy[];
 }
@@ -111,8 +139,10 @@ export interface AuditEvent {
   requestId: string;
   principal: Principal | null;
   connectorId: string;
+  protocol?: "http" | "mcp";
   method: string;
   path: string;
+  toolName?: string;
   decision: "allow" | "deny" | "error";
   matchedPolicyId?: string;
   reason?: string;
@@ -183,6 +213,20 @@ export function validateGatewayConfig(input: unknown): GatewayConfig {
   const jwtSecret =
     typeof rawAuth.jwtSecret === "string" ? rawAuth.jwtSecret : undefined;
 
+  const rawVault = isObject(input.vault) ? input.vault : undefined;
+  const vault: GatewayVaultConfig | undefined = rawVault
+    ? {
+        masterKey:
+          typeof rawVault.masterKey === "string"
+            ? rawVault.masterKey
+            : undefined,
+        sqlitePath:
+          typeof rawVault.sqlitePath === "string"
+            ? rawVault.sqlitePath
+            : undefined,
+      }
+    : undefined;
+
   const rawConnectors = Array.isArray(input.connectors) ? input.connectors : [];
   const connectors: Connector[] = rawConnectors.map((c, idx) => {
     if (!isObject(c)) {
@@ -204,6 +248,9 @@ export function validateGatewayConfig(input: unknown): GatewayConfig {
       baseUrl: c.baseUrl,
       auth,
       timeoutMs: typeof c.timeoutMs === "number" ? c.timeoutMs : 15000,
+      mcpTools: Array.isArray(c.mcpTools)
+        ? (c.mcpTools as McpToolMapping[])
+        : undefined,
     };
   });
 
@@ -270,6 +317,7 @@ export function validateGatewayConfig(input: unknown): GatewayConfig {
   return {
     server: { host, port },
     auth: { mode: authMode, jwtSecret, headerPrefix },
+    vault,
     connectors,
     policies,
   };

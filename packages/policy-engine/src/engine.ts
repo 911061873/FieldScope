@@ -1,6 +1,11 @@
 import type { Policy, Principal, ResponseRule } from "@fieldscope/core";
 import { evaluateExpression } from "./expr.ts";
-import { matchMethod, matchPath, matchPrincipal } from "./matcher.ts";
+import {
+  matchMethod,
+  matchPath,
+  matchPrincipal,
+  matchToolName,
+} from "./matcher.ts";
 import { resolveTemplateValue, setNestedValue } from "./template.ts";
 
 export interface PolicyEvaluationInput {
@@ -9,8 +14,10 @@ export interface PolicyEvaluationInput {
   protocol?: "http" | "mcp";
   method: string;
   path: string;
+  toolName?: string;
   query?: Record<string, unknown>;
   body?: unknown;
+  args?: Record<string, unknown>;
 }
 
 export interface PolicyEvaluationResult {
@@ -19,6 +26,7 @@ export interface PolicyEvaluationResult {
   reason?: string;
   query: Record<string, unknown>;
   body: unknown;
+  args: Record<string, unknown>;
   enforcedParams: string[];
   responseRule?: ResponseRule;
 }
@@ -27,8 +35,72 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function policyMatchesTarget(
+  policy: Policy,
+  input: {
+    principal: Principal;
+    connectorId: string;
+    protocol: "http" | "mcp";
+    method: string;
+    path: string;
+    toolName?: string;
+  }
+): boolean {
+  if (
+    policy.match.connector !== "*" &&
+    policy.match.connector !== input.connectorId
+  ) {
+    return false;
+  }
+  if (policy.action.protocol !== input.protocol) {
+    return false;
+  }
+  if (!matchPrincipal(input.principal, policy.match.principal)) {
+    return false;
+  }
+
+  if (input.protocol === "mcp") {
+    const toolName = input.toolName ?? "";
+    const patterns =
+      policy.action.tools && policy.action.tools.length > 0
+        ? policy.action.tools
+        : ["*"];
+    return patterns.some((pattern) => matchToolName(toolName, pattern));
+  }
+
+  if (!matchMethod(input.method, policy.action.methods)) {
+    return false;
+  }
+  return policy.action.paths.some((pattern) => matchPath(input.path, pattern));
+}
+
 /**
- * Evaluates a set of policies against an incoming request.
+ * Checks whether an MCP tool should be exposed to the given principal during `tools/list`.
+ * Applies Default Deny + Explicit Deny overrides Allow.
+ */
+export function isToolVisible(
+  policies: Policy[],
+  principal: Principal,
+  connectorId: string,
+  toolName: string
+): boolean {
+  const matching = policies.filter((p) =>
+    policyMatchesTarget(p, {
+      principal,
+      connectorId,
+      protocol: "mcp",
+      method: "POST",
+      path: "/mcp",
+      toolName,
+    })
+  );
+  if (matching.length === 0) return false;
+  if (matching.some((p) => p.effect === "deny")) return false;
+  return matching.some((p) => p.effect === "allow");
+}
+
+/**
+ * Evaluates a set of policies against an incoming HTTP or MCP request.
  * Security model:
  * - Default Deny when no policy matches.
  * - Explicit Deny overrides Allow.
@@ -42,40 +114,36 @@ export function evaluatePolicies(
   const queryCopy: Record<string, unknown> = structuredClone(input.query ?? {});
   let bodyCopy: unknown =
     input.body === undefined ? undefined : structuredClone(input.body);
+  const argsCopy: Record<string, unknown> = structuredClone(input.args ?? {});
 
-  const matching = policies.filter((policy) => {
-    if (policy.match.connector !== "*" && policy.match.connector !== input.connectorId) {
-      return false;
-    }
-    if (policy.action.protocol !== protocol) {
-      return false;
-    }
-    if (!matchPrincipal(input.principal, policy.match.principal)) {
-      return false;
-    }
-    if (!matchMethod(input.method, policy.action.methods)) {
-      return false;
-    }
-    const pathMatches = policy.action.paths.some((pattern) =>
-      matchPath(input.path, pattern)
-    );
-    return pathMatches;
-  });
+  const matching = policies.filter((policy) =>
+    policyMatchesTarget(policy, {
+      principal: input.principal,
+      connectorId: input.connectorId,
+      protocol,
+      method: input.method,
+      path: input.path,
+      toolName: input.toolName,
+    })
+  );
 
   if (matching.length === 0) {
+    const targetDesc =
+      protocol === "mcp"
+        ? `MCP tool '${input.toolName ?? ""}'`
+        : `${input.method.toUpperCase()} ${input.path}`;
     return {
       allowed: false,
-      reason: `Access denied: no policy allows ${input.method.toUpperCase()} ${input.path} on connector '${input.connectorId}'`,
+      reason: `Access denied: no policy allows ${targetDesc} on connector '${input.connectorId}'`,
       query: queryCopy,
       body: bodyCopy,
+      args: argsCopy,
       enforcedParams: [],
     };
   }
 
-  // Sort by priority descending (higher number wins)
   const sorted = [...matching].sort((a, b) => b.priority - a.priority);
 
-  // Explicit deny always overrides allow
   const denyPolicy = sorted.find((p) => p.effect === "deny");
   if (denyPolicy) {
     return {
@@ -84,6 +152,7 @@ export function evaluatePolicies(
       reason: `Access denied by explicit deny policy '${denyPolicy.name ?? denyPolicy.id}'`,
       query: queryCopy,
       body: bodyCopy,
+      args: argsCopy,
       enforcedParams: [],
     };
   }
@@ -93,11 +162,12 @@ export function evaluatePolicies(
     principal: input.principal,
     query: queryCopy,
     body: bodyCopy ?? {},
+    args: argsCopy,
     method: input.method.toUpperCase(),
     path: input.path,
+    toolName: input.toolName,
   };
 
-  // 1. Parameter validation rules
   if (allowPolicy.request?.validate) {
     for (const rule of allowPolicy.request.validate) {
       let passed = false;
@@ -112,6 +182,7 @@ export function evaluatePolicies(
           }`,
           query: queryCopy,
           body: bodyCopy,
+          args: argsCopy,
           enforcedParams: [],
         };
       }
@@ -122,13 +193,13 @@ export function evaluatePolicies(
           reason: rule.message,
           query: queryCopy,
           body: bodyCopy,
+          args: argsCopy,
           enforcedParams: [],
         };
       }
     }
   }
 
-  // 2. Parameter enforcement (force-inject / override query or body parameters)
   const enforcedParams: string[] = [];
   if (allowPolicy.request?.enforce) {
     for (const [targetPath, rawTemplate] of Object.entries(
@@ -142,6 +213,7 @@ export function evaluatePolicies(
           reason: `Failed to enforce parameter '${targetPath}': required principal attribute is missing`,
           query: queryCopy,
           body: bodyCopy,
+          args: argsCopy,
           enforcedParams,
         };
       }
@@ -157,6 +229,10 @@ export function evaluatePolicies(
         }
         setNestedValue(bodyCopy as Record<string, unknown>, nestedPath, resolved);
         enforcedParams.push(targetPath);
+      } else if (targetPath.startsWith("args.")) {
+        const nestedPath = targetPath.slice("args.".length);
+        setNestedValue(argsCopy, nestedPath, resolved);
+        enforcedParams.push(targetPath);
       }
     }
   }
@@ -166,6 +242,7 @@ export function evaluatePolicies(
     matchedPolicyId: allowPolicy.id,
     query: queryCopy,
     body: bodyCopy,
+    args: argsCopy,
     enforcedParams,
     responseRule: allowPolicy.response,
   };

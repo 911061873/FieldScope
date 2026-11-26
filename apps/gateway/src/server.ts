@@ -8,17 +8,31 @@ import {
 import type { AddressInfo } from "node:net";
 import type { AuditEvent, Connector, GatewayConfig } from "@fieldscope/core";
 import { applyFieldRules } from "@fieldscope/field-engine";
+import {
+  handleMcpRequest,
+  type JsonRpcRequest,
+} from "@fieldscope/mcp-adapter";
 import { evaluatePolicies } from "@fieldscope/policy-engine";
+import {
+  CredentialCipher,
+  InMemoryCredentialStore,
+  OAuthTokenManager,
+  SqliteCredentialStore,
+  injectUpstreamCredential,
+  type CredentialStore,
+} from "@fieldscope/vault";
 import { ConsoleAuditSink, type AuditSink } from "./audit.ts";
 import { resolvePrincipal } from "./auth.ts";
 
 export interface CreateGatewayOptions {
   config: GatewayConfig;
   auditSink?: AuditSink;
+  tokenManager?: OAuthTokenManager;
 }
 
 export interface GatewayServer {
   server: Server;
+  tokenManager: OAuthTokenManager;
   listen(host?: string, port?: number): Promise<string>;
   close(): Promise<void>;
 }
@@ -36,33 +50,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   "content-length",
   "authorization",
 ]);
-
-function applyConnectorAuth(
-  connector: Connector,
-  url: URL,
-  headers: Record<string, string>
-): void {
-  switch (connector.auth.type) {
-    case "none":
-      break;
-    case "bearer":
-      headers["authorization"] = `Bearer ${connector.auth.token}`;
-      break;
-    case "header":
-      headers[connector.auth.headerName.toLowerCase()] = connector.auth.value;
-      break;
-    case "query":
-      url.searchParams.set(connector.auth.paramName, connector.auth.value);
-      break;
-    case "basic": {
-      const encoded = Buffer.from(
-        `${connector.auth.username}:${connector.auth.password}`
-      ).toString("base64");
-      headers["authorization"] = `Basic ${encoded}`;
-      break;
-    }
-  }
-}
 
 function sendJson(
   res: ServerResponse,
@@ -98,10 +85,35 @@ async function readRequestBody(req: IncomingMessage): Promise<unknown> {
   return raw;
 }
 
+function createDefaultVault(config: GatewayConfig): {
+  store: CredentialStore;
+  tokenManager: OAuthTokenManager;
+} {
+  const masterKey =
+    config.vault?.masterKey ??
+    process.env.FIELDSCOPE_VAULT_KEY ??
+    "fieldscope-dev-ephemeral-master-key";
+  const cipher = new CredentialCipher(masterKey);
+  const store: CredentialStore = config.vault?.sqlitePath
+    ? new SqliteCredentialStore(config.vault.sqlitePath, cipher)
+    : new InMemoryCredentialStore(cipher);
+  return { store, tokenManager: new OAuthTokenManager(store) };
+}
+
 export function createGatewayServer(
   options: CreateGatewayOptions
 ): GatewayServer {
   const { config, auditSink = new ConsoleAuditSink() } = options;
+
+  let ownedStore: CredentialStore | undefined;
+  let tokenManager: OAuthTokenManager;
+  if (options.tokenManager) {
+    tokenManager = options.tokenManager;
+  } else {
+    const created = createDefaultVault(config);
+    ownedStore = created.store;
+    tokenManager = created.tokenManager;
+  }
 
   const connectorMap = new Map<string, Connector>();
   for (const connector of config.connectors) {
@@ -118,16 +130,83 @@ export function createGatewayServer(
     if (method === "GET" && pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
+        protocols: ["http", "mcp"],
         connectors: config.connectors.length,
         policies: config.policies.length,
       });
     }
 
+    // MCP Streamable HTTP endpoint (JSON-RPC 2.0)
+    if (method === "POST" && pathname === "/mcp") {
+      const authResult = resolvePrincipal(req.headers, config.auth);
+      if (!authResult.ok) {
+        auditSink.record({
+          timestamp: new Date().toISOString(),
+          requestId,
+          principal: null,
+          connectorId: "mcp",
+          protocol: "mcp",
+          method,
+          path: pathname,
+          decision: "deny",
+          reason: authResult.message,
+          durationMs: Date.now() - startTime,
+        });
+        return sendJson(res, 401, {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32001, message: authResult.message },
+        });
+      }
+
+      let body: unknown;
+      try {
+        body = await readRequestBody(req);
+      } catch {
+        return sendJson(res, 400, {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32700, message: "Parse error: invalid JSON" },
+        });
+      }
+
+      if (typeof body !== "object" || body === null) {
+        return sendJson(res, 400, {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: "Invalid Request" },
+        });
+      }
+
+      const rpcResponse = await handleMcpRequest(
+        body as JsonRpcRequest,
+        authResult.principal,
+        {
+          connectors: config.connectors,
+          policies: config.policies,
+          tokenManager,
+          onAudit: (event) => auditSink.record(event),
+        }
+      );
+
+      if (rpcResponse === null) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+
+      return sendJson(res, 200, rpcResponse, {
+        "x-fieldscope-request-id": requestId,
+      });
+    }
+
+    // HTTP Reverse Proxy endpoint
     const proxyMatch = pathname.match(/^\/proxy\/([^/]+)(\/.*)?$/);
     if (!proxyMatch) {
       return sendJson(res, 404, {
         error: "not_found",
-        message: "Use /proxy/:connectorId/* to access governed upstream APIs",
+        message:
+          "Use /proxy/:connectorId/* for HTTP proxy or POST /mcp for MCP gateway",
         requestId,
       });
     }
@@ -138,13 +217,20 @@ export function createGatewayServer(
     const recordAudit = (
       partial: Omit<
         AuditEvent,
-        "timestamp" | "requestId" | "connectorId" | "method" | "path" | "durationMs"
+        | "timestamp"
+        | "requestId"
+        | "connectorId"
+        | "protocol"
+        | "method"
+        | "path"
+        | "durationMs"
       >
     ) => {
       auditSink.record({
         timestamp: new Date().toISOString(),
         requestId,
         connectorId,
+        protocol: "http",
         method,
         path: upstreamPath,
         durationMs: Date.now() - startTime,
@@ -183,7 +269,6 @@ export function createGatewayServer(
 
     const principal = authResult.principal;
 
-    // Parse query & body
     const queryObj: Record<string, unknown> = {};
     for (const [k, v] of reqUrl.searchParams.entries()) {
       if (k in queryObj) {
@@ -236,7 +321,7 @@ export function createGatewayServer(
       });
     }
 
-    // 3. Build upstream request with enforced params and injected credentials
+    // 3. Build upstream request with enforced params and hybrid credential injection
     const base = connector.baseUrl.endsWith("/")
       ? connector.baseUrl.slice(0, -1)
       : connector.baseUrl;
@@ -265,7 +350,29 @@ export function createGatewayServer(
       }
     }
 
-    applyConnectorAuth(connector, targetUrl, forwardHeaders);
+    try {
+      await injectUpstreamCredential(
+        connector,
+        principal,
+        targetUrl,
+        forwardHeaders,
+        tokenManager
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to resolve upstream credential";
+      recordAudit({
+        principal,
+        decision: "error",
+        matchedPolicyId: evaluation.matchedPolicyId,
+        reason: message,
+      });
+      return sendJson(res, 401, {
+        error: "upstream_credential_required",
+        message,
+        requestId,
+      });
+    }
 
     const hasBody =
       method !== "GET" && method !== "HEAD" && evaluation.body !== undefined;
@@ -339,7 +446,6 @@ export function createGatewayServer(
       return sendJson(res, upstreamRes.status, fieldResult.data, extraHeaders);
     }
 
-    // Non-JSON passthrough
     const rawBuffer = Buffer.from(await upstreamRes.arrayBuffer());
     recordAudit({
       principal,
@@ -361,6 +467,7 @@ export function createGatewayServer(
 
   return {
     server,
+    tokenManager,
     listen(host = config.server.host, port = config.server.port) {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -373,7 +480,11 @@ export function createGatewayServer(
     },
     close() {
       return new Promise((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
+        server.close((err) => {
+          ownedStore?.close?.();
+          if (err) reject(err);
+          else resolve();
+        });
       });
     },
   };

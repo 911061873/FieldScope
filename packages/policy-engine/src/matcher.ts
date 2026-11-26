@@ -75,6 +75,15 @@ function normalizePath(p: string): string {
   return clean;
 }
 
+export function matchToolName(toolName: string, pattern: string): boolean {
+  if (pattern === "*") return true;
+  const regexStr = pattern
+    .split("*")
+    .map((lit) => escapeRegex(lit))
+    .join(".*");
+  return new RegExp(`^${regexStr}$`).test(toolName);
+}
+
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
