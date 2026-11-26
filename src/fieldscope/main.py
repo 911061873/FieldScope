@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -96,6 +96,12 @@ def create_app(
 
         @app.get("/{full_path:path}", include_in_schema=False)
         async def serve_spa(full_path: str) -> FileResponse:
+            if full_path.startswith(("api/", "gateway/", "mcp")) or full_path in (
+                "api",
+                "gateway",
+                "mcp",
+            ):
+                raise HTTPException(status_code=404, detail="Not Found")
             candidate = (static_dir / full_path).resolve()
             if (
                 full_path

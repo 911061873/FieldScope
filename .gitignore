@@ -221,3 +221,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# FieldScope local DB & Vue frontend artifacts
+fieldscope.db
+*.sqlite
+*.sqlite3
+web/node_modules/
+web/dist/
+

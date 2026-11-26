@@ -1,0 +1,72 @@
+:root {
+  --fs-bg: #f5f7f9;
+  --fs-surface: #ffffff;
+  --fs-border: #e5e9ef;
+  --fs-text: #18202c;
+  --fs-text-muted: #5f6c7b;
+  --fs-primary: #0f766e;
+  --fs-primary-soft: #ecfdf5;
+  --fs-radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--fs-bg);
+  color: var(--fs-text);
+  font-family: "Inter", "PingFang SC", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--fs-text);
+}
+
+.page-subtitle {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--fs-text-muted);
+}
+
+.surface-card {
+  background: var(--fs-surface);
+  border: 1px solid var(--fs-border);
+  border-radius: var(--fs-radius);
+  padding: 18px 20px;
+}
+
+.mono-code {
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.secret-box {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 12px 14px;
+  word-break: break-all;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  color: #0f172a;
+}
