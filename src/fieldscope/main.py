@@ -22,6 +22,7 @@ from fieldscope.api.routers import (
 )
 from fieldscope.auth_engine.cache import TokenCacheBackend
 from fieldscope.auth_engine.engine import AuthEngine
+from fieldscope.connectors.mcp_upstream import UpstreamMcpClient
 from fieldscope.core.config import Settings, get_settings
 from fieldscope.core.crypto import SecretCipher
 from fieldscope.db.seed import seed_initial_data
@@ -37,10 +38,13 @@ def create_app(
     token_cache: TokenCacheBackend | None = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
+    cfg.validate_runtime_security()
+
     db_manager = DatabaseManager(cfg.database_url, echo=cfg.debug)
     cipher = SecretCipher(cfg.encryption_key)
     auth_engine = AuthEngine(cipher=cipher, cache=token_cache, http_client=http_client)
-    gateway_pipeline = GatewayPipeline(auth_engine=auth_engine)
+    mcp_upstream = UpstreamMcpClient(auth_engine=auth_engine)
+    gateway_pipeline = GatewayPipeline(auth_engine=auth_engine, mcp_upstream=mcp_upstream)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -62,12 +66,14 @@ def create_app(
     app.state.db = db_manager
     app.state.cipher = cipher
     app.state.auth_engine = auth_engine
+    app.state.mcp_upstream = mcp_upstream
     app.state.gateway_pipeline = gateway_pipeline
 
+    allow_credentials = "*" not in cfg.cors_origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cfg.cors_origins,
-        allow_credentials=True,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )

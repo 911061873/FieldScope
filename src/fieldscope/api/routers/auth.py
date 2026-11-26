@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import time
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +16,7 @@ from fieldscope.core.security import (
     USER_API_KEY_PREFIX,
     create_access_token,
     generate_api_key,
+    hash_password,
     verify_password,
 )
 from fieldscope.db.models import User, UserApiKey
@@ -24,15 +27,58 @@ from fieldscope.schemas.iam import UserApiKeyCreate, UserApiKeyCreated, UserApiK
 
 router = APIRouter(prefix="/api/v1/admin/auth", tags=["auth"])
 
+# Precomputed scrypt hash used when username does not exist to equalize verification timing
+_DUMMY_PASSWORD_HASH = hash_password("fieldscope-timing-equalization-dummy-password")
+
+
+def _check_and_record_login_rate_limit(
+    request: Request,
+    username: str,
+    settings: Settings,
+) -> tuple[str, list[float]]:
+    attempts_map: dict[str, list[float]] | None = getattr(
+        request.app.state, "login_attempts", None
+    )
+    if attempts_map is None:
+        attempts_map = {}
+        request.app.state.login_attempts = attempts_map
+
+    client_host = request.client.host if request.client else "unknown"
+    key = f"{client_host}:{username.lower()}"
+    now = time.monotonic()
+    window = max(1, settings.login_rate_limit_window_seconds)
+    max_attempts = max(1, settings.login_rate_limit_max_attempts)
+
+    recent = [ts for ts in attempts_map.get(key, []) if now - ts < window]
+    attempts_map[key] = recent
+    if len(recent) >= max_attempts:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Please try again later.",
+        )
+    return key, recent
+
 
 @router.post("/login", response_model=TokenResponse)
 async def login(
     body: LoginRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> TokenResponse:
+    rl_key, recent = _check_and_record_login_rate_limit(request, body.username, settings)
+
     user = await db.scalar(select(User).where(User.username == body.username))
-    if user is None or not verify_password(body.password, user.password_hash):
+    if user is None:
+        # Equalize response timing with a real scrypt verification against a dummy hash
+        verify_password(body.password, _DUMMY_PASSWORD_HASH)
+        recent.append(time.monotonic())
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+        )
+    if not verify_password(body.password, user.password_hash):
+        recent.append(time.monotonic())
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password",
@@ -42,6 +88,9 @@ async def login(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is disabled",
         )
+
+    # Clear failed attempts on successful login
+    request.app.state.login_attempts.pop(rl_key, None)
 
     token, expires_at = create_access_token(
         subject=str(user.id),

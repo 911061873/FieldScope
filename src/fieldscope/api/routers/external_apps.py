@@ -49,6 +49,8 @@ async def create_external_app(
         key_prefix=key_prefix,
         key_hash=key_hash,
         user_identity_header=body.user_identity_header,
+        allowed_user_ids=list(dict.fromkeys(body.allowed_user_ids)),
+        allowed_external_role_ids=list(dict.fromkeys(body.allowed_external_role_ids)),
         is_active=body.is_active,
     )
     db.add(app)
@@ -76,6 +78,10 @@ async def update_external_app(
         app.description = body.description
     if body.user_identity_header is not None:
         app.user_identity_header = body.user_identity_header
+    if body.allowed_user_ids is not None:
+        app.allowed_user_ids = list(dict.fromkeys(body.allowed_user_ids))
+    if body.allowed_external_role_ids is not None:
+        app.allowed_external_role_ids = list(dict.fromkeys(body.allowed_external_role_ids))
     if body.is_active is not None:
         app.is_active = body.is_active
     await db.commit()

@@ -6,10 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from fieldscope.api.deps import require_permissions
-from fieldscope.auth_engine.engine import AuthEngine, AuthEngineError
+from fieldscope.auth_engine.engine import AuthEngineError
 from fieldscope.connectors.mcp_upstream import UpstreamMcpClient, UpstreamMcpError
 from fieldscope.db.models import Platform, PlatformEndpoint, User
 from fieldscope.db.session import get_db
+from fieldscope.gateway.pipeline import canonicalize_path_pattern
 from fieldscope.schemas.common import MessageResponse
 from fieldscope.schemas.platform import (
     PlatformCreate,
@@ -29,6 +30,66 @@ async def _load_platform(db: AsyncSession, platform_id: int) -> Platform | None:
         .where(Platform.id == platform_id)
         .options(selectinload(Platform.endpoints))
     )
+
+
+async def _check_endpoint_collisions(
+    db: AsyncSession,
+    *,
+    platform: Platform,
+    resource_type: str,
+    method: str | None,
+    path_pattern: str | None,
+    expose_as_mcp: bool,
+    effective_tool_name: str,
+    exclude_endpoint_id: int | None = None,
+) -> None:
+    if resource_type == "http_endpoint" and path_pattern:
+        target_method = (method or "GET").upper()
+        target_canon = canonicalize_path_pattern(path_pattern)
+        siblings = (
+            await db.scalars(
+                select(PlatformEndpoint).where(
+                    PlatformEndpoint.platform_id == platform.id,
+                    PlatformEndpoint.resource_type == "http_endpoint",
+                )
+            )
+        ).all()
+        for ep in siblings:
+            if exclude_endpoint_id is not None and ep.id == exclude_endpoint_id:
+                continue
+            if not ep.path_pattern:
+                continue
+            if (ep.method or "GET").upper() == target_method and (
+                canonicalize_path_pattern(ep.path_pattern) == target_canon
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Route collision on platform '{platform.code}': "
+                        f"{target_method} {path_pattern} conflicts with endpoint '{ep.code}'"
+                    ),
+                )
+
+    if resource_type == "mcp_tool" or expose_as_mcp:
+        all_eps = (
+            await db.scalars(
+                select(PlatformEndpoint).options(selectinload(PlatformEndpoint.platform))
+            )
+        ).all()
+        for ep in all_eps:
+            if exclude_endpoint_id is not None and ep.id == exclude_endpoint_id:
+                continue
+            if ep.resource_type == "http_endpoint" and not ep.expose_as_mcp:
+                continue
+            other_name = ep.mcp_tool_name or f"{ep.platform.code}_{ep.code}"
+            if other_name == effective_tool_name:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"MCP tool name '{effective_tool_name}' is already used by "
+                        f"'{ep.platform.code}.{ep.code}'"
+                    ),
+                )
 
 
 @router.get("", response_model=list[PlatformRead])
@@ -64,7 +125,9 @@ async def create_platform(
         description=body.description,
         protocol_type=body.protocol_type,
         base_url=body.base_url.rstrip("/"),
-        mcp_transport=body.mcp_transport if body.protocol_type == "mcp" else None,
+        mcp_transport=(body.mcp_transport or "streamable_http")
+        if body.protocol_type == "mcp"
+        else None,
         timeout_ms=body.timeout_ms,
         extra_headers=body.extra_headers,
         is_active=body.is_active,
@@ -176,6 +239,17 @@ async def create_platform_endpoint(
             detail=f"Endpoint code '{body.code}' already exists on platform '{platform.code}'",
         )
 
+    effective_tool_name = body.mcp_tool_name or f"{platform.code}_{body.code}"
+    await _check_endpoint_collisions(
+        db,
+        platform=platform,
+        resource_type=body.resource_type,
+        method=body.method,
+        path_pattern=body.path_pattern,
+        expose_as_mcp=body.expose_as_mcp,
+        effective_tool_name=effective_tool_name,
+    )
+
     endpoint = PlatformEndpoint(
         platform_id=platform_id,
         resource_type=body.resource_type,
@@ -185,7 +259,7 @@ async def create_platform_endpoint(
         method=body.method.upper() if body.method else None,
         path_pattern=body.path_pattern,
         expose_as_mcp=body.expose_as_mcp,
-        mcp_tool_name=body.mcp_tool_name or f"{platform.code}_{body.code}",
+        mcp_tool_name=effective_tool_name,
         input_schema=body.input_schema,
         output_schema=body.output_schema,
         is_active=body.is_active,
@@ -205,13 +279,37 @@ async def update_platform_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> PlatformEndpointRead:
     endpoint = await db.scalar(
-        select(PlatformEndpoint).where(
+        select(PlatformEndpoint)
+        .where(
             PlatformEndpoint.id == endpoint_id,
             PlatformEndpoint.platform_id == platform_id,
         )
+        .options(selectinload(PlatformEndpoint.platform))
     )
     if endpoint is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Endpoint not found")
+
+    next_method = body.method.upper() if body.method is not None else endpoint.method
+    next_path = body.path_pattern if body.path_pattern is not None else endpoint.path_pattern
+    next_expose = (
+        body.expose_as_mcp if body.expose_as_mcp is not None else endpoint.expose_as_mcp
+    )
+    next_tool_name = (
+        body.mcp_tool_name
+        if body.mcp_tool_name is not None
+        else (endpoint.mcp_tool_name or f"{endpoint.platform.code}_{endpoint.code}")
+    )
+    await _check_endpoint_collisions(
+        db,
+        platform=endpoint.platform,
+        resource_type=endpoint.resource_type,
+        method=next_method,
+        path_pattern=next_path,
+        expose_as_mcp=next_expose,
+        effective_tool_name=next_tool_name,
+        exclude_endpoint_id=endpoint.id,
+    )
+
     if body.name is not None:
         endpoint.name = body.name
     if body.description is not None:
@@ -272,8 +370,7 @@ async def sync_upstream_mcp_tools(
             detail="Only MCP platforms support syncing upstream MCP tools",
         )
 
-    auth_engine: AuthEngine = request.app.state.auth_engine
-    mcp_client = UpstreamMcpClient(auth_engine)
+    mcp_client: UpstreamMcpClient = request.app.state.mcp_upstream
     try:
         upstream_tools = await mcp_client.list_tools(db, platform)
     except (AuthEngineError, UpstreamMcpError) as exc:

@@ -135,6 +135,11 @@ class ExternalApp(TimestampMixin, Base):
         default="X-FieldScope-User",
         nullable=False,
     )
+    # Optional delegation scope: when non-empty, only matching users/external-roles may be delegated
+    allowed_user_ids: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
+    allowed_external_role_ids: Mapped[list[int]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
     last_used_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 

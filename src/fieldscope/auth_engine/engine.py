@@ -210,6 +210,8 @@ class AuthEngine:
         self._cipher = cipher
         self._cache: TokenCacheBackend = cache or InMemoryTokenCache()
         self._external_http_client = http_client
+        # Single-use OAuth state nonce registry: nonce -> expiration unix timestamp
+        self._oauth_state_nonces: dict[str, float] = {}
 
     def _auth_aad(self, platform_id: int) -> str:
         return f"platform:{platform_id}:auth"
@@ -219,6 +221,19 @@ class AuthEngine:
 
     def _cache_key(self, platform_id: int) -> str:
         return f"platform:{platform_id}:token"
+
+    def get_token_preview(self, platform_id: int, state: PlatformTokenState) -> str | None:
+        """Safely decrypt and mask a stored access token for admin status views."""
+        if not state.access_token_encrypted:
+            return None
+        try:
+            decrypted = self._cipher.decrypt_str(
+                state.access_token_encrypted,
+                aad=self._token_aad(platform_id),
+            )
+            return mask_token_preview(decrypted)
+        except Exception:
+            return "***"
 
     async def load_auth_config(
         self,
@@ -289,6 +304,37 @@ class AuthEngine:
                 state.refresh_token_encrypted = None
                 state.last_error = None
 
+    async def _load_db_token(
+        self,
+        db: AsyncSession,
+        platform_id: int,
+    ) -> CachedToken | None:
+        state = await db.scalar(
+            select(PlatformTokenState).where(PlatformTokenState.platform_id == platform_id)
+        )
+        if state is None or (
+            not state.access_token_encrypted and not state.refresh_token_encrypted
+        ):
+            return None
+
+        aad = self._token_aad(platform_id)
+        access_token = (
+            self._cipher.decrypt_str(state.access_token_encrypted, aad=aad)
+            if state.access_token_encrypted
+            else ""
+        )
+        refresh_token = (
+            self._cipher.decrypt_str(state.refresh_token_encrypted, aad=aad)
+            if state.refresh_token_encrypted
+            else None
+        )
+        return CachedToken(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            token_type=state.token_type,
+            expires_at=state.expires_at,
+        )
+
     async def _load_cached_or_db_token(
         self,
         db: AsyncSession,
@@ -298,25 +344,9 @@ class AuthEngine:
         if cached is not None:
             return cached
 
-        state = await db.scalar(
-            select(PlatformTokenState).where(PlatformTokenState.platform_id == platform_id)
-        )
-        if state is None or not state.access_token_encrypted:
+        token = await self._load_db_token(db, platform_id)
+        if token is None or not token.access_token:
             return None
-
-        aad = self._token_aad(platform_id)
-        access_token = self._cipher.decrypt_str(state.access_token_encrypted, aad=aad)
-        refresh_token = (
-            self._cipher.decrypt_str(state.refresh_token_encrypted, aad=aad)
-            if state.refresh_token_encrypted
-            else None
-        )
-        token = CachedToken(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            token_type=state.token_type,
-            expires_at=state.expires_at,
-        )
         await self._cache.set(self._cache_key(platform_id), token)
         return token
 
@@ -414,6 +444,37 @@ class AuthEngine:
             is_dynamic=is_dynamic,
         )
 
+    async def send_http_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout_ms: int,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        form_body: dict[str, Any] | None = None,
+        content: bytes | str | None = None,
+    ) -> httpx.Response:
+        """Send an upstream HTTP request using the configured AsyncClient or an ephemeral client."""
+        timeout = httpx.Timeout(timeout_ms / 1000.0)
+        kwargs: dict[str, Any] = {
+            "headers": headers,
+            "params": params,
+            "timeout": timeout,
+        }
+        if json_body is not None:
+            kwargs["json"] = json_body
+        elif form_body is not None:
+            kwargs["data"] = form_body
+        elif content is not None:
+            kwargs["content"] = content
+
+        if self._external_http_client is not None:
+            return await self._external_http_client.request(method, url, **kwargs)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.request(method, url, **kwargs)
+
     async def _http_request(
         self,
         method: str,
@@ -425,26 +486,15 @@ class AuthEngine:
         json_body: Any = None,
         form_body: dict[str, Any] | None = None,
     ) -> httpx.Response:
-        timeout = httpx.Timeout(timeout_ms / 1000.0)
-        if self._external_http_client is not None:
-            return await self._external_http_client.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                json=json_body,
-                data=form_body,
-                timeout=timeout,
-            )
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            return await client.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                json=json_body,
-                data=form_body,
-            )
+        return await self.send_http_request(
+            method,
+            url,
+            timeout_ms=timeout_ms,
+            headers=headers,
+            params=params,
+            json_body=json_body,
+            form_body=form_body,
+        )
 
     async def _fetch_oauth2_token(
         self,
@@ -486,7 +536,7 @@ class AuthEngine:
             form["client_id"] = config.client_id
             form["client_secret"] = config.client_secret
 
-        resp = await self._http_request(
+        resp = await self.send_http_request(
             "POST",
             config.token_url,
             timeout_ms=timeout_ms,
@@ -549,7 +599,7 @@ class AuthEngine:
         json_body = rendered_body if spec.body_type == "json" else None
         form_body = rendered_body if spec.body_type == "form" else None
 
-        resp = await self._http_request(
+        resp = await self.send_http_request(
             spec.method,
             rendered_url,
             timeout_ms=timeout_ms,
@@ -611,10 +661,15 @@ class AuthEngine:
         config: OAuth2AuthConfig | CustomHttpAuthConfig,
         existing: CachedToken | None,
     ) -> CachedToken:
+        # Always reload latest DB token state so rotating refresh tokens survive multi-worker runs
+        db_token = await self._load_db_token(db, platform.id)
+        latest = db_token or existing
+
         if isinstance(config, OAuth2AuthConfig):
-            refresh_tok = existing.refresh_token if existing else None
-            if refresh_tok is None:
-                refresh_tok = await self._load_db_refresh_token(db, platform.id)
+            refresh_tok = (
+                (db_token.refresh_token if db_token else None)
+                or (existing.refresh_token if existing else None)
+            )
             if refresh_tok:
                 try:
                     return await self._fetch_oauth2_token(
@@ -629,13 +684,13 @@ class AuthEngine:
             return await self._fetch_oauth2_token(config, timeout_ms=platform.timeout_ms)
 
         # CustomHttpAuthConfig
-        if config.refresh_request is not None and existing is not None:
+        if config.refresh_request is not None and latest is not None:
             try:
                 return await self._execute_custom_http_spec(
                     config.refresh_request,
                     config,
                     timeout_ms=platform.timeout_ms,
-                    existing_token=existing,
+                    existing_token=latest,
                 )
             except AuthEngineError:
                 # Fall back to primary token_request if refresh_request fails
@@ -645,7 +700,7 @@ class AuthEngine:
             config.token_request,
             config,
             timeout_ms=platform.timeout_ms,
-            existing_token=existing,
+            existing_token=latest,
         )
 
     async def get_injection(
@@ -656,32 +711,35 @@ class AuthEngine:
         force_refresh: bool = False,
         failed_token: str | None = None,
         ignore_cache: bool = False,
+        config: PlatformAuthConfigPayload | None = None,
     ) -> AuthInjection:
         """Resolve upstream auth headers/query params with single-flight proactive renewal."""
-        config, _ = await self.load_auth_config(db, platform.id)
+        resolved_cfg = config
+        if resolved_cfg is None:
+            resolved_cfg, _ = await self.load_auth_config(db, platform.id)
 
-        if isinstance(config, NoneAuthConfig):
+        if isinstance(resolved_cfg, NoneAuthConfig):
             return AuthInjection(is_dynamic=False)
 
-        if isinstance(config, StaticAuthConfig):
+        if isinstance(resolved_cfg, StaticAuthConfig):
             return self._build_injection(
-                location=config.location,
-                param_name=config.param_name,
-                prefix=config.value_prefix,
-                token_value=config.value,
+                location=resolved_cfg.location,
+                param_name=resolved_cfg.param_name,
+                prefix=resolved_cfg.value_prefix,
+                token_value=resolved_cfg.value,
                 is_dynamic=False,
             )
 
         # Dynamic auth: OAuth2 or Custom HTTP
-        leeway = config.refresh_leeway_seconds
+        leeway = resolved_cfg.refresh_leeway_seconds
         if not force_refresh and not ignore_cache:
             cached = await self._load_cached_or_db_token(db, platform.id)
             if self._is_token_usable(cached, leeway_seconds=leeway, failed_token=failed_token):
                 assert cached is not None
                 return self._build_injection(
-                    location=config.inject_location,
-                    param_name=config.inject_name,
-                    prefix=config.inject_prefix,
+                    location=resolved_cfg.inject_location,
+                    param_name=resolved_cfg.inject_name,
+                    prefix=resolved_cfg.inject_prefix,
                     token_value=cached.access_token,
                     is_dynamic=True,
                 )
@@ -697,24 +755,24 @@ class AuthEngine:
             ):
                 assert current is not None
                 return self._build_injection(
-                    location=config.inject_location,
-                    param_name=config.inject_name,
-                    prefix=config.inject_prefix,
+                    location=resolved_cfg.inject_location,
+                    param_name=resolved_cfg.inject_name,
+                    prefix=resolved_cfg.inject_prefix,
                     token_value=current.access_token,
                     is_dynamic=True,
                 )
 
             try:
-                new_token = await self._fetch_dynamic_token(db, platform, config, current)
+                new_token = await self._fetch_dynamic_token(db, platform, resolved_cfg, current)
             except AuthEngineError as exc:
                 await self._record_token_error(db, platform.id, str(exc))
                 raise
 
             await self._persist_token(db, platform.id, new_token)
             return self._build_injection(
-                location=config.inject_location,
-                param_name=config.inject_name,
-                prefix=config.inject_prefix,
+                location=resolved_cfg.inject_location,
+                param_name=resolved_cfg.inject_name,
+                prefix=resolved_cfg.inject_prefix,
                 token_value=new_token.access_token,
                 is_dynamic=True,
             )
@@ -727,7 +785,7 @@ class AuthEngine:
     ) -> tuple[httpx.Response, bool]:
         """Execute an upstream HTTP call with auth injection and single refresh-replay."""
         config, _ = await self.load_auth_config(db, platform.id)
-        injection = await self.get_injection(db, platform)
+        injection = await self.get_injection(db, platform, config=config)
         response = await request_fn(injection)
 
         if not isinstance(config, (OAuth2AuthConfig, CustomHttpAuthConfig)):
@@ -749,6 +807,7 @@ class AuthEngine:
             platform,
             force_refresh=True,
             failed_token=injection.raw_token,
+            config=config,
         )
         replayed = await request_fn(refreshed_injection)
         return replayed, True
@@ -756,6 +815,11 @@ class AuthEngine:
     # -----------------------------------------------------------------------
     # OAuth2 Admin Authorization Code Helpers
     # -----------------------------------------------------------------------
+
+    def _prune_oauth_nonces(self, now_ts: float) -> None:
+        expired = [k for k, exp in self._oauth_state_nonces.items() if exp <= now_ts]
+        for k in expired:
+            self._oauth_state_nonces.pop(k, None)
 
     def build_oauth_authorize_url(
         self,
@@ -771,13 +835,18 @@ class AuthEngine:
                 "Platform is not configured with OAuth2 authorization_code grant_type"
             )
         now = utc_now()
+        exp_ts = (now + timedelta(minutes=15)).timestamp()
+        nonce = secrets.token_urlsafe(16)
+        self._prune_oauth_nonces(now.timestamp())
+        self._oauth_state_nonces[nonce] = exp_ts
+
         state = jwt.encode(
             {
                 "purpose": "fieldscope_oauth_state",
                 "pid": platform_id,
-                "nonce": secrets.token_urlsafe(12),
+                "nonce": nonce,
                 "iat": int(now.timestamp()),
-                "exp": int((now + timedelta(minutes=15)).timestamp()),
+                "exp": int(exp_ts),
             },
             jwt_secret,
             algorithm=jwt_algorithm,
@@ -813,6 +882,13 @@ class AuthEngine:
             or payload.get("pid") != expected_platform_id
         ):
             raise AuthEngineError("OAuth state does not match target platform")
+
+        nonce = payload.get("nonce")
+        now_ts = utc_now().timestamp()
+        self._prune_oauth_nonces(now_ts)
+        if not isinstance(nonce, str) or nonce not in self._oauth_state_nonces:
+            raise AuthEngineError("OAuth state has already been used or is unrecognized")
+        self._oauth_state_nonces.pop(nonce, None)
 
     async def exchange_oauth_code(
         self,

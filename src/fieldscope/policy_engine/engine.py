@@ -257,6 +257,22 @@ def validate_request_params(
     return True, None
 
 
+class GovernanceError(RuntimeError):
+    """Raised when response or request governance cannot be safely applied (fail-closed)."""
+
+
+def has_active_response_governance(decision: PolicyDecision) -> bool:
+    """Return True if any row filtering, field pruning, or field masking applies."""
+    has_row_filter = bool(decision.row_filters) and not decision.row_filter_unrestricted
+    fr = decision.field_rules
+    has_field_rules = (
+        fr.mode in ("allowlist", "denylist")
+        or bool(fr.denied_fields)
+        or bool(fr.transforms)
+    )
+    return has_row_filter or has_field_rules
+
+
 def apply_enforced_params_http(
     enforced: dict[str, Any],
     *,
@@ -277,8 +293,11 @@ def apply_enforced_params_http(
         elif key.startswith("body."):
             if new_body is None:
                 new_body = {}
-            if isinstance(new_body, dict):
-                _set_nested(new_body, key[len("body.") :], val)
+            if not isinstance(new_body, dict):
+                raise GovernanceError(
+                    f"Cannot enforce body parameter '{key}' on non-object request body"
+                )
+            _set_nested(new_body, key[len("body.") :], val)
     return new_query, new_body, new_path
 
 
@@ -339,7 +358,11 @@ def apply_row_filters(
     *,
     user: User,
 ) -> RowFilterResult:
-    """Filter response JSON rows post-fetch using OR union across matched allow policies."""
+    """Filter response JSON rows post-fetch using OR union across matched allow policies.
+
+    Fail-closed: if a configured row_filter list_path is missing/not a list, or if an
+    expression fails safety validation, raises GovernanceError rather than leaking data.
+    """
     if decision.row_filter_unrestricted or not decision.row_filters:
         return RowFilterResult(data=data)
 
@@ -358,7 +381,10 @@ def apply_row_filters(
     for list_path, exprs in by_path.items():
         parent, key, target_list = _get_nested_list_container(working, list_path)
         if target_list is None:
-            continue
+            path_label = list_path or "<root>"
+            raise GovernanceError(
+                f"Row filter fail-closed: list_path '{path_label}' not found or not a JSON list"
+            )
 
         kept: list[Any] = []
         for row in target_list:
@@ -369,8 +395,10 @@ def apply_row_filters(
                     if bool(evaluate_expr(expr, row_ctx)):
                         matched_any = True
                         break
-                except UnsafeExpressionError:
-                    continue
+                except UnsafeExpressionError as exc:
+                    raise GovernanceError(
+                        f"Row filter fail-closed: invalid expression ({exc})"
+                    ) from exc
             if matched_any:
                 kept.append(row)
 

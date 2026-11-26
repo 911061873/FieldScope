@@ -15,12 +15,12 @@ from fieldscope.auth_engine.engine import (
     AuthInjection,
     OAuthAuthorizationRequiredError,
     mask_auth_config,
-    mask_token_preview,
 )
 from fieldscope.core.config import Settings
 from fieldscope.db.base import utc_now
 from fieldscope.db.models import Platform, PlatformTokenState, User
 from fieldscope.db.session import get_db
+from fieldscope.gateway.pipeline import _validate_actual_path
 from fieldscope.schemas.platform_auth import (
     OAuth2AuthConfig,
     OAuthAuthorizeUrlResponse,
@@ -64,16 +64,7 @@ async def _build_token_status(
             is_expired=False,
         )
 
-    preview: str | None = None
-    if state.access_token_encrypted:
-        try:
-            decrypted = auth_engine._cipher.decrypt_str(
-                state.access_token_encrypted,
-                aad=auth_engine._token_aad(platform_id),
-            )
-            preview = mask_token_preview(decrypted)
-        except Exception:
-            preview = "***"
+    preview = auth_engine.get_token_preview(platform_id, state)
 
     now = utc_now()
     is_expired = bool(state.expires_at is not None and state.expires_at <= now)
@@ -157,6 +148,7 @@ async def refresh_platform_token(
             platform,
             force_refresh=True,
             ignore_cache=True,
+            config=cfg,
         )
     except OAuthAuthorizationRequiredError as exc:
         raise HTTPException(
@@ -239,15 +231,29 @@ async def test_platform_auth(
 ) -> PlatformAuthTestResponse:
     """Execute a live test request against the platform using configured auth & retry loop."""
     platform = await _get_platform_or_404(db, platform_id)
-    target_path = body.path.lstrip("/")
-    url = f"{platform.base_url}/{target_path}" if target_path else platform.base_url
+    raw_path = (body.path or "").strip()
+    if raw_path:
+        if "://" in raw_path or raw_path.startswith("//") or "@" in raw_path:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Test path must be a relative path on the configured platform",
+            )
+        safe_path = _validate_actual_path(raw_path)
+        if safe_path is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Test path contains disallowed traversal or control characters",
+            )
+        url = f"{platform.base_url}{safe_path}"
+    else:
+        url = platform.base_url
 
     started = time.perf_counter()
 
     async def _send(injection: AuthInjection) -> httpx.Response:
         merged_headers = {**platform.extra_headers, **body.headers, **injection.headers}
         merged_query = {**body.query, **injection.query_params}
-        return await auth_engine._http_request(
+        return await auth_engine.send_http_request(
             body.method,
             url,
             timeout_ms=platform.timeout_ms,

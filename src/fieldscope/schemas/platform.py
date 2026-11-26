@@ -12,7 +12,7 @@ class PlatformCreate(BaseModel):
     description: str = ""
     protocol_type: Literal["api", "mcp"] = "api"
     base_url: str = Field(min_length=1, max_length=512)
-    mcp_transport: Literal["streamable_http", "sse"] | None = None
+    mcp_transport: Literal["streamable_http"] | None = None
     timeout_ms: int = Field(default=15000, ge=500, le=300000)
     extra_headers: dict[str, str] = Field(default_factory=dict)
     is_active: bool = True
@@ -22,7 +22,7 @@ class PlatformUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     description: str | None = None
     base_url: str | None = Field(default=None, min_length=1, max_length=512)
-    mcp_transport: Literal["streamable_http", "sse"] | None = None
+    mcp_transport: Literal["streamable_http"] | None = None
     timeout_ms: int | None = Field(default=None, ge=500, le=300000)
     extra_headers: dict[str, str] | None = None
     is_active: bool | None = None

@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from fieldscope.policy_engine.expr import UnsafeExpressionError, validate_expression_syntax
 
 # ---------------------------------------------------------------------------
 # Structured 4-Layer External Policy Rules
@@ -13,6 +15,15 @@ from pydantic import BaseModel, Field
 class ValidationRule(BaseModel):
     expr: str = Field(min_length=1, description="Safe expression validated before upstream call")
     message: str = Field(default="Request parameter violates data scope policy")
+
+    @field_validator("expr")
+    @classmethod
+    def _check_expr(cls, value: str) -> str:
+        try:
+            validate_expression_syntax(value)
+        except UnsafeExpressionError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
 
 
 class RequestRules(BaseModel):
@@ -38,6 +49,15 @@ class RowFilterRule(BaseModel):
         min_length=1,
         description="Safe row-level predicate expression using row.* and user.*",
     )
+
+    @field_validator("expr")
+    @classmethod
+    def _check_expr(cls, value: str) -> str:
+        try:
+            validate_expression_syntax(value)
+        except UnsafeExpressionError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
 
 
 FieldTransformAction = Literal[

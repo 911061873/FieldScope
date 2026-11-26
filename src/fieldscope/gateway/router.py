@@ -31,9 +31,11 @@ async def http_proxy_gateway(
 ) -> Response:
     """Data-plane HTTP reverse proxy with per-user policy, auth renewal, row & field governance."""
     body: Any = None
+    raw_body: bytes | None = None
     if request.method in ("POST", "PUT", "PATCH"):
         raw = await request.body()
         if raw:
+            raw_body = raw
             try:
                 body = await request.json()
             except ValueError:
@@ -48,18 +50,20 @@ async def http_proxy_gateway(
         query_params=dict(request.query_params),
         incoming_headers=dict(request.headers),
         body=body,
+        raw_body=raw_body,
     )
+    resp_headers = {**result.headers, "X-FieldScope-Trace-Id": result.trace_id}
     if result.is_json:
         return JSONResponse(
             content=result.body,
             status_code=result.status_code,
-            headers={"X-FieldScope-Trace-Id": result.trace_id},
+            headers=resp_headers,
         )
     return Response(
         content=result.body,
         status_code=result.status_code,
         media_type=result.content_type,
-        headers={"X-FieldScope-Trace-Id": result.trace_id},
+        headers=resp_headers,
     )
 
 
@@ -78,6 +82,22 @@ def _jsonrpc_error(req_id: Any, code: int, message: str, http_status: int = 200)
     )
 
 
+@router.get("/mcp")
+async def mcp_streamable_http_get(
+    _principal: DataPlanePrincipal = Depends(resolve_data_plane_principal),
+) -> Response:
+    """Server-initiated SSE stream is not offered; return 405 per MCP Streamable HTTP spec."""
+    return Response(status_code=405, headers={"Allow": "POST, DELETE"})
+
+
+@router.delete("/mcp")
+async def mcp_streamable_http_delete(
+    _principal: DataPlanePrincipal = Depends(resolve_data_plane_principal),
+) -> Response:
+    """Stateless session termination acknowledgement."""
+    return Response(status_code=204)
+
+
 @router.post("/mcp")
 async def mcp_streamable_http_gateway(
     request: Request,
@@ -94,9 +114,14 @@ async def mcp_streamable_http_gateway(
     if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
         return _jsonrpc_error(None, -32600, "Invalid Request: expected JSON-RPC 2.0 object")
 
+    is_notification = "id" not in payload
     req_id = payload.get("id")
     method = payload.get("method")
     params = payload.get("params") or {}
+
+    # JSON-RPC 2.0 notifications must not receive an error/result payload
+    if is_notification or (isinstance(method, str) and method.startswith("notifications/")):
+        return Response(status_code=202)
 
     if method == "initialize":
         return _jsonrpc_ok(
@@ -107,9 +132,6 @@ async def mcp_streamable_http_gateway(
                 "serverInfo": {"name": "FieldScope", "version": "0.1.0"},
             },
         )
-
-    if method == "notifications/initialized":
-        return Response(status_code=202)
 
     if method == "ping":
         return _jsonrpc_ok(req_id, {})

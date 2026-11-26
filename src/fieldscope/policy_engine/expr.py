@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import ast
 import re
+from functools import lru_cache
 from typing import Any
+
+MAX_EXPRESSION_LENGTH = 2000
+MAX_AST_NODES = 200
+MAX_STRING_CONCAT_LEN = 4096
 
 
 class UnsafeExpressionError(ValueError):
@@ -20,6 +25,42 @@ _TOKEN_RE = re.compile(
     |(?P<false>\bfalse\b)
     """,
     re.VERBOSE,
+)
+
+_ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BoolOp,
+    ast.And,
+    ast.Or,
+    ast.UnaryOp,
+    ast.Not,
+    ast.USub,
+    ast.UAdd,
+    ast.BinOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Mod,
+    ast.Compare,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.In,
+    ast.NotIn,
+    ast.Is,
+    ast.IsNot,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.Attribute,
+    ast.Subscript,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
 )
 
 
@@ -44,6 +85,10 @@ def _normalize_expression(expr: str) -> str:
         return match.group(0)
 
     return _TOKEN_RE.sub(_replace, expr)
+
+
+def _is_number(val: Any) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
 
 
 def _safe_get(target: Any, key: Any) -> Any:
@@ -114,9 +159,9 @@ def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
         if isinstance(node.op, ast.Not):
             return not bool(operand)
         if isinstance(node.op, ast.USub):
-            return -operand if isinstance(operand, (int, float)) else None
+            return -operand if _is_number(operand) else None
         if isinstance(node.op, ast.UAdd):
-            return +operand if isinstance(operand, (int, float)) else None
+            return +operand if _is_number(operand) else None
         raise UnsafeExpressionError(f"Unsupported unary op: {type(node.op).__name__}")
 
     if isinstance(node, ast.BinOp):
@@ -125,15 +170,30 @@ def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
         if left is None or right is None:
             return None
         if isinstance(node.op, ast.Add):
-            return left + right
+            if _is_number(left) and _is_number(right):
+                return left + right
+            if isinstance(left, str) and isinstance(right, str):
+                if len(left) + len(right) > MAX_STRING_CONCAT_LEN:
+                    raise UnsafeExpressionError("String concatenation exceeds maximum length")
+                return left + right
+            raise UnsafeExpressionError("Addition only supports numbers or bounded strings")
         if isinstance(node.op, ast.Sub):
-            return left - right
+            if _is_number(left) and _is_number(right):
+                return left - right
+            raise UnsafeExpressionError("Subtraction only supports numbers")
         if isinstance(node.op, ast.Mult):
-            return left * right
+            # Disallow sequence repetition (e.g. 'x' * 10**9) to prevent memory DoS
+            if _is_number(left) and _is_number(right):
+                return left * right
+            raise UnsafeExpressionError("Multiplication only supports numeric operands")
         if isinstance(node.op, ast.Div):
-            return left / right if right != 0 else None
+            if _is_number(left) and _is_number(right):
+                return left / right if right != 0 else None
+            raise UnsafeExpressionError("Division only supports numbers")
         if isinstance(node.op, ast.Mod):
-            return left % right if right != 0 else None
+            if _is_number(left) and _is_number(right):
+                return left % right if right != 0 else None
+            raise UnsafeExpressionError("Modulo only supports numbers")
         raise UnsafeExpressionError(f"Unsupported binary op: {type(node.op).__name__}")
 
     if isinstance(node, ast.Compare):
@@ -211,61 +271,44 @@ def _apply_compare(op: ast.cmpop, left: Any, right: Any) -> bool:
     raise UnsafeExpressionError(f"Unsupported comparison operator: {type(op).__name__}")
 
 
-def validate_expression_syntax(expr: str) -> None:
-    """Validate that an expression parses safely using only whitelisted AST constructs."""
+@lru_cache(maxsize=1024)
+def _compile_expression(expr: str) -> ast.Expression:
+    """Parse, validate, and cache a safe expression AST."""
+    if not isinstance(expr, str) or not expr.strip():
+        raise UnsafeExpressionError("Expression must be a non-empty string")
+    if len(expr) > MAX_EXPRESSION_LENGTH:
+        raise UnsafeExpressionError(
+            f"Expression length exceeds limit of {MAX_EXPRESSION_LENGTH} characters"
+        )
+
     normalized = _normalize_expression(expr)
     try:
         tree = ast.parse(normalized, mode="eval")
     except SyntaxError as exc:
         raise UnsafeExpressionError(f"Invalid expression syntax: {exc}") from exc
 
-    allowed_nodes = (
-        ast.Expression,
-        ast.BoolOp,
-        ast.And,
-        ast.Or,
-        ast.UnaryOp,
-        ast.Not,
-        ast.USub,
-        ast.UAdd,
-        ast.BinOp,
-        ast.Add,
-        ast.Sub,
-        ast.Mult,
-        ast.Div,
-        ast.Mod,
-        ast.Compare,
-        ast.Eq,
-        ast.NotEq,
-        ast.Lt,
-        ast.LtE,
-        ast.Gt,
-        ast.GtE,
-        ast.In,
-        ast.NotIn,
-        ast.Is,
-        ast.IsNot,
-        ast.Constant,
-        ast.Name,
-        ast.Load,
-        ast.Attribute,
-        ast.Subscript,
-        ast.List,
-        ast.Tuple,
-        ast.Set,
-    )
+    node_count = 0
     for node in ast.walk(tree):
-        if not isinstance(node, allowed_nodes):
+        node_count += 1
+        if node_count > MAX_AST_NODES:
+            raise UnsafeExpressionError(
+                f"Expression complexity exceeds limit of {MAX_AST_NODES} AST nodes"
+            )
+        if not isinstance(node, _ALLOWED_AST_NODES):
             raise UnsafeExpressionError(f"Disallowed AST node: {type(node).__name__}")
         if isinstance(node, ast.Name) and node.id.startswith("_"):
             raise UnsafeExpressionError(f"Disallowed identifier: {node.id}")
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise UnsafeExpressionError(f"Disallowed attribute: {node.attr}")
+    return tree
+
+
+def validate_expression_syntax(expr: str) -> None:
+    """Validate that an expression parses safely using only whitelisted AST constructs."""
+    _compile_expression(expr)
 
 
 def evaluate_expr(expr: str, context: dict[str, Any]) -> Any:
     """Safely evaluate a policy expression against a read-only dictionary context."""
-    validate_expression_syntax(expr)
-    normalized = _normalize_expression(expr)
-    tree = ast.parse(normalized, mode="eval")
+    tree = _compile_expression(expr)
     return _eval_node(tree, context)

@@ -53,10 +53,7 @@
             <n-form-item label="MCP 传输模式">
               <n-select
                 v-model:value="platformForm.mcp_transport"
-                :options="[
-                  { label: 'Streamable HTTP', value: 'streamable_http' },
-                  { label: 'SSE', value: 'sse' },
-                ]"
+                :options="[{ label: 'Streamable HTTP', value: 'streamable_http' }]"
               />
             </n-form-item>
           </n-gi>
@@ -68,6 +65,15 @@
         </n-grid>
         <n-form-item label="基础地址 (Base URL)" required>
           <n-input v-model:value="platformForm.base_url" placeholder="https://api.example.com" />
+        </n-form-item>
+        <n-form-item label="附加请求头 JSON (extra_headers，可选)">
+          <n-input
+            v-model:value="platformForm.extraHeadersJson"
+            type="textarea"
+            :rows="2"
+            class="mono-code"
+            placeholder='{"X-Tenant": "acme"}'
+          />
         </n-form-item>
         <n-form-item label="说明">
           <n-input v-model:value="platformForm.description" type="textarea" :rows="2" />
@@ -451,13 +457,22 @@
       </n-drawer-content>
     </n-drawer>
 
-    <!-- Create Endpoint Modal -->
-    <n-modal v-model:show="showEndpointModal" preset="card" title="新增 API 接口" style="width: 540px">
+    <!-- Create / Edit Endpoint Modal -->
+    <n-modal
+      v-model:show="showEndpointModal"
+      preset="card"
+      :title="editingEndpoint ? `编辑接口：${editingEndpoint.code}` : '新增 API 接口'"
+      style="width: 540px"
+    >
       <n-form label-placement="top">
         <n-grid :cols="2" :x-gap="12">
           <n-gi>
             <n-form-item label="接口编码" required>
-              <n-input v-model:value="epForm.code" placeholder="例如 list_customers" />
+              <n-input
+                v-model:value="epForm.code"
+                :disabled="Boolean(editingEndpoint)"
+                placeholder="例如 list_customers"
+              />
             </n-form-item>
           </n-gi>
           <n-gi>
@@ -465,7 +480,7 @@
               <n-input v-model:value="epForm.name" placeholder="例如 查询客户列表" />
             </n-form-item>
           </n-gi>
-          <n-gi>
+          <n-gi v-if="!editingEndpoint || editingEndpoint.resource_type === 'http_endpoint'">
             <n-form-item label="HTTP 方法" required>
               <n-select
                 v-model:value="epForm.method"
@@ -479,7 +494,11 @@
             </n-form-item>
           </n-gi>
         </n-grid>
-        <n-form-item label="路径模板 (Path Pattern)" required>
+        <n-form-item
+          v-if="!editingEndpoint || editingEndpoint.resource_type === 'http_endpoint'"
+          label="路径模板 (Path Pattern)"
+          required
+        >
           <n-input v-model:value="epForm.path_pattern" placeholder="例如 /api/v1/customers 或 /api/v1/issue/{key}" />
         </n-form-item>
         <n-form-item v-if="epForm.expose_as_mcp" label="MCP Tool 名称（留空默认 {platform}_{code}）">
@@ -491,11 +510,14 @@
         <n-form-item label="入参 JSON Schema">
           <n-input v-model:value="epForm.inputSchemaJson" type="textarea" :rows="3" class="mono-code" />
         </n-form-item>
+        <n-form-item label="启用状态" label-placement="left">
+          <n-switch v-model:value="epForm.is_active" />
+        </n-form-item>
       </n-form>
       <template #footer>
         <n-space justify="end">
           <n-button @click="showEndpointModal = false">取消</n-button>
-          <n-button type="primary" :loading="savingEndpoint" @click="handleCreateEndpoint">保存接口</n-button>
+          <n-button type="primary" :loading="savingEndpoint" @click="handleSaveEndpoint">保存接口</n-button>
         </n-space>
       </template>
     </n-modal>
@@ -556,8 +578,9 @@ const platformForm = reactive({
   description: "",
   protocol_type: "api" as "api" | "mcp",
   base_url: "",
-  mcp_transport: "streamable_http" as "streamable_http" | "sse",
+  mcp_transport: "streamable_http" as "streamable_http",
   timeout_ms: 15000,
+  extraHeadersJson: "{}",
   is_active: true,
 });
 
@@ -566,6 +589,7 @@ const showAuthDrawer = ref(false);
 const activePlatform = ref<PlatformItem | null>(null);
 const savingAuth = ref(false);
 const authType = ref<"none" | "static" | "oauth2" | "custom_http">("none");
+const loadedAuthConfig = ref<Record<string, any> | null>(null);
 
 const staticForm = reactive({
   location: "header" as "header" | "query",
@@ -619,6 +643,7 @@ const testResult = ref<PlatformAuthTestResult | null>(null);
 // Endpoints Drawer State
 const showEndpointsDrawer = ref(false);
 const showEndpointModal = ref(false);
+const editingEndpoint = ref<PlatformEndpoint | null>(null);
 const savingEndpoint = ref(false);
 const syncingMcp = ref(false);
 const epForm = reactive({
@@ -630,6 +655,7 @@ const epForm = reactive({
   expose_as_mcp: true,
   mcp_tool_name: "",
   inputSchemaJson: '{"type": "object", "properties": {}}',
+  is_active: true,
 });
 
 const columns = computed<DataTableColumns<PlatformItem>>(() => [
@@ -709,18 +735,25 @@ const endpointColumns = computed<DataTableColumns<PlatformEndpoint>>(() => [
   {
     title: "操作",
     key: "actions",
-    width: 80,
+    width: 130,
     render: (r) =>
       canWrite.value
-        ? h(
-            NPopconfirm,
-            { onPositiveClick: () => handleDeleteEndpoint(r.id) },
-            {
-              trigger: () =>
-                h(NButton, { size: "small", quaternary: true, type: "error" }, () => "删除"),
-              default: () => `确认删除「${r.code}」？`,
-            }
-          )
+        ? h(NSpace, { size: 4 }, () => [
+            h(
+              NButton,
+              { size: "small", quaternary: true, onClick: () => openEditEndpoint(r) },
+              () => "编辑"
+            ),
+            h(
+              NPopconfirm,
+              { onPositiveClick: () => handleDeleteEndpoint(r.id) },
+              {
+                trigger: () =>
+                  h(NButton, { size: "small", quaternary: true, type: "error" }, () => "删除"),
+                default: () => `确认删除「${r.code}」？`,
+              }
+            ),
+          ])
         : "-",
   },
 ]);
@@ -750,6 +783,7 @@ function openCreatePlatform() {
     base_url: "",
     mcp_transport: "streamable_http",
     timeout_ms: 15000,
+    extraHeadersJson: "{}",
     is_active: true,
   });
   showPlatformModal.value = true;
@@ -763,14 +797,27 @@ function openEditPlatform(row: PlatformItem) {
     description: row.description,
     protocol_type: row.protocol_type,
     base_url: row.base_url,
-    mcp_transport: row.mcp_transport || "streamable_http",
+    mcp_transport: "streamable_http",
     timeout_ms: row.timeout_ms,
+    extraHeadersJson: JSON.stringify(row.extra_headers || {}, null, 2),
     is_active: row.is_active,
   });
   showPlatformModal.value = true;
 }
 
 async function handleSavePlatform() {
+  let extraHeaders: Record<string, string> = {};
+  try {
+    const parsed = JSON.parse(platformForm.extraHeadersJson || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("not object");
+    }
+    extraHeaders = parsed;
+  } catch {
+    message.error("附加请求头必须是合法的 JSON 对象");
+    return;
+  }
+
   savingPlatform.value = true;
   try {
     if (editingPlatform.value) {
@@ -782,6 +829,7 @@ async function handleSavePlatform() {
           base_url: platformForm.base_url,
           mcp_transport: platformForm.protocol_type === "mcp" ? platformForm.mcp_transport : null,
           timeout_ms: platformForm.timeout_ms,
+          extra_headers: extraHeaders,
           is_active: platformForm.is_active,
         },
       });
@@ -789,8 +837,15 @@ async function handleSavePlatform() {
       await apiRequest("/api/v1/admin/platforms", {
         method: "POST",
         body: {
-          ...platformForm,
+          code: platformForm.code,
+          name: platformForm.name,
+          description: platformForm.description,
+          protocol_type: platformForm.protocol_type,
+          base_url: platformForm.base_url,
           mcp_transport: platformForm.protocol_type === "mcp" ? platformForm.mcp_transport : null,
+          timeout_ms: platformForm.timeout_ms,
+          extra_headers: extraHeaders,
+          is_active: platformForm.is_active,
         },
       });
     }
@@ -821,11 +876,13 @@ async function openAuthDrawer(row: PlatformItem) {
   oauthState.value = "";
   oauthCodeInput.value = "";
   testResult.value = null;
+  loadedAuthConfig.value = null;
 
   try {
     const cfg = await apiRequest<PlatformAuthConfigRead>(`/api/v1/admin/platforms/${row.id}/auth`);
     authType.value = cfg.auth_type;
     const c = cfg.config || {};
+    loadedAuthConfig.value = JSON.parse(JSON.stringify(c));
     if (cfg.auth_type === "static") {
       Object.assign(staticForm, {
         location: c.location || "header",
@@ -882,13 +939,18 @@ async function loadTokenStatus() {
 async function handleSaveAuth() {
   if (!activePlatform.value) return;
   let payload: Record<string, unknown> = { auth_type: "none" };
+  const prev =
+    loadedAuthConfig.value && loadedAuthConfig.value.auth_type === authType.value
+      ? loadedAuthConfig.value
+      : {};
 
   try {
     if (authType.value === "static") {
-      payload = { auth_type: "static", ...staticForm };
+      payload = { ...prev, auth_type: "static", ...staticForm };
     } else if (authType.value === "oauth2") {
       const bodyRules = JSON.parse(oauthForm.bodyRulesJson || "[]");
       payload = {
+        ...prev,
         auth_type: "oauth2",
         grant_type: oauthForm.grant_type,
         client_id: oauthForm.client_id,
@@ -902,15 +964,20 @@ async function handleSaveAuth() {
         inject_name: oauthForm.inject_name,
         inject_prefix: oauthForm.inject_prefix,
         refresh_leeway_seconds: oauthForm.refresh_leeway_seconds,
-        invalid_rules: { http_statuses: [401], body_rules: bodyRules },
+        invalid_rules: {
+          ...(prev.invalid_rules || { http_statuses: [401] }),
+          body_rules: bodyRules,
+        },
       };
     } else if (authType.value === "custom_http") {
       const bodyObj = JSON.parse(customForm.bodyJson || "{}");
       const secretsObj = JSON.parse(customForm.secretsJson || "{}");
       const bodyRules = JSON.parse(customForm.bodyRulesJson || "[]");
       payload = {
+        ...prev,
         auth_type: "custom_http",
         token_request: {
+          ...(prev.token_request || {}),
           method: customForm.method,
           url: customForm.url,
           body_type: customForm.body_type,
@@ -918,6 +985,7 @@ async function handleSaveAuth() {
         },
         secrets: secretsObj,
         response_mapping: {
+          ...(prev.response_mapping || {}),
           access_token_path: customForm.access_token_path,
           expires_in_path: customForm.expires_in_path || null,
           fixed_ttl_seconds: customForm.fixed_ttl_seconds,
@@ -926,7 +994,10 @@ async function handleSaveAuth() {
         inject_name: customForm.inject_name,
         inject_prefix: customForm.inject_prefix,
         refresh_leeway_seconds: customForm.refresh_leeway_seconds,
-        invalid_rules: { http_statuses: [401], body_rules: bodyRules },
+        invalid_rules: {
+          ...(prev.invalid_rules || { http_statuses: [401] }),
+          body_rules: bodyRules,
+        },
       };
     }
   } catch {
@@ -936,10 +1007,14 @@ async function handleSaveAuth() {
 
   savingAuth.value = true;
   try {
-    await apiRequest(`/api/v1/admin/platforms/${activePlatform.value.id}/auth`, {
-      method: "PUT",
-      body: payload,
-    });
+    const saved = await apiRequest<PlatformAuthConfigRead>(
+      `/api/v1/admin/platforms/${activePlatform.value.id}/auth`,
+      {
+        method: "PUT",
+        body: payload,
+      }
+    );
+    loadedAuthConfig.value = JSON.parse(JSON.stringify(saved.config || {}));
     message.success("认证配置已加密保存");
     await loadTokenStatus();
   } catch (err: any) {
@@ -1022,6 +1097,7 @@ function openEndpointsDrawer(row: PlatformItem) {
 }
 
 function openCreateEndpoint() {
+  editingEndpoint.value = null;
   Object.assign(epForm, {
     code: "",
     name: "",
@@ -1031,11 +1107,28 @@ function openCreateEndpoint() {
     expose_as_mcp: true,
     mcp_tool_name: "",
     inputSchemaJson: '{"type": "object", "properties": {}}',
+    is_active: true,
   });
   showEndpointModal.value = true;
 }
 
-async function handleCreateEndpoint() {
+function openEditEndpoint(ep: PlatformEndpoint) {
+  editingEndpoint.value = ep;
+  Object.assign(epForm, {
+    code: ep.code,
+    name: ep.name,
+    description: ep.description,
+    method: ep.method || "GET",
+    path_pattern: ep.path_pattern || "",
+    expose_as_mcp: ep.expose_as_mcp,
+    mcp_tool_name: ep.mcp_tool_name || "",
+    inputSchemaJson: JSON.stringify(ep.input_schema || { type: "object", properties: {} }, null, 2),
+    is_active: ep.is_active,
+  });
+  showEndpointModal.value = true;
+}
+
+async function handleSaveEndpoint() {
   if (!activePlatform.value) return;
   let schemaObj: Record<string, unknown> = {};
   try {
@@ -1046,25 +1139,46 @@ async function handleCreateEndpoint() {
   }
   savingEndpoint.value = true;
   try {
-    await apiRequest(`/api/v1/admin/platforms/${activePlatform.value.id}/endpoints`, {
-      method: "POST",
-      body: {
-        resource_type: "http_endpoint",
-        code: epForm.code,
+    if (editingEndpoint.value) {
+      const updateBody: Record<string, unknown> = {
         name: epForm.name,
         description: epForm.description,
-        method: epForm.method,
-        path_pattern: epForm.path_pattern,
         expose_as_mcp: epForm.expose_as_mcp,
         mcp_tool_name: epForm.mcp_tool_name || null,
         input_schema: schemaObj,
-      },
-    });
-    message.success("接口已添加");
+        is_active: epForm.is_active,
+      };
+      if (editingEndpoint.value.resource_type === "http_endpoint") {
+        updateBody.method = epForm.method;
+        updateBody.path_pattern = epForm.path_pattern;
+      }
+      await apiRequest(
+        `/api/v1/admin/platforms/${activePlatform.value.id}/endpoints/${editingEndpoint.value.id}`,
+        { method: "PATCH", body: updateBody }
+      );
+      message.success("接口已更新");
+    } else {
+      await apiRequest(`/api/v1/admin/platforms/${activePlatform.value.id}/endpoints`, {
+        method: "POST",
+        body: {
+          resource_type: "http_endpoint",
+          code: epForm.code,
+          name: epForm.name,
+          description: epForm.description,
+          method: epForm.method,
+          path_pattern: epForm.path_pattern,
+          expose_as_mcp: epForm.expose_as_mcp,
+          mcp_tool_name: epForm.mcp_tool_name || null,
+          input_schema: schemaObj,
+          is_active: epForm.is_active,
+        },
+      });
+      message.success("接口已添加");
+    }
     showEndpointModal.value = false;
     await loadPlatforms();
   } catch (err: any) {
-    message.error(err?.detail || "添加接口失败");
+    message.error(err?.detail || "保存接口失败");
   } finally {
     savingEndpoint.value = false;
   }

@@ -25,6 +25,26 @@
         <n-form-item label="用户标识请求头">
           <n-input v-model:value="form.user_identity_header" placeholder="默认 X-FieldScope-User" />
         </n-form-item>
+        <n-form-item label="允许代调用的用户范围（留空不限制）">
+          <n-select
+            v-model:value="form.allowed_user_ids"
+            multiple
+            clearable
+            filterable
+            :options="userOptions"
+            placeholder="留空表示不限制特定用户"
+          />
+        </n-form-item>
+        <n-form-item label="允许代调用的外部角色范围（留空不限制）">
+          <n-select
+            v-model:value="form.allowed_external_role_ids"
+            multiple
+            clearable
+            filterable
+            :options="externalRoleOptions"
+            placeholder="留空表示不限制特定外部角色"
+          />
+        </n-form-item>
         <n-form-item label="描述">
           <n-input v-model:value="form.description" type="textarea" :rows="2" />
         </n-form-item>
@@ -66,6 +86,7 @@ import {
   NInput,
   NModal,
   NPopconfirm,
+  NSelect,
   NSpace,
   NSwitch,
   NTag,
@@ -73,7 +94,7 @@ import {
   type DataTableColumns,
 } from "naive-ui";
 import { apiRequest } from "@/api/client";
-import type { ExternalApp } from "@/api/types";
+import type { ExternalApp, ExternalRole, UserItem } from "@/api/types";
 import { useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
@@ -83,6 +104,8 @@ const canWrite = computed(() => auth.hasPermission("external_app:write"));
 const loading = ref(false);
 const saving = ref(false);
 const apps = ref<ExternalApp[]>([]);
+const allUsers = ref<UserItem[]>([]);
+const allExternalRoles = ref<ExternalRole[]>([]);
 const showForm = ref(false);
 const editing = ref<ExternalApp | null>(null);
 const showSecret = ref(false);
@@ -93,8 +116,17 @@ const form = reactive({
   name: "",
   description: "",
   user_identity_header: "X-FieldScope-User",
+  allowed_user_ids: [] as number[],
+  allowed_external_role_ids: [] as number[],
   is_active: true,
 });
+
+const userOptions = computed(() =>
+  allUsers.value.map((u) => ({ label: `${u.display_name || u.username} (${u.username})`, value: u.id }))
+);
+const externalRoleOptions = computed(() =>
+  allExternalRoles.value.map((r) => ({ label: `${r.name} (${r.code})`, value: r.id }))
+);
 
 const columns = computed<DataTableColumns<ExternalApp>>(() => [
   { title: "应用编码", key: "app_code", render: (r) => h("code", { class: "mono-code" }, r.app_code) },
@@ -108,6 +140,22 @@ const columns = computed<DataTableColumns<ExternalApp>>(() => [
     title: "用户标识 Header",
     key: "user_identity_header",
     render: (r) => h("code", { class: "mono-code" }, r.user_identity_header),
+  },
+  {
+    title: "委托范围",
+    key: "scope",
+    render: (r) => {
+      const uCount = r.allowed_user_ids?.length || 0;
+      const rCount = r.allowed_external_role_ids?.length || 0;
+      if (!uCount && !rCount) {
+        return h(NTag, { size: "small", type: "warning", bordered: false }, () => "全部用户");
+      }
+      return h(
+        NTag,
+        { size: "small", type: "info", bordered: false },
+        () => `${uCount} 用户 / ${rCount} 角色`
+      );
+    },
   },
   {
     title: "状态",
@@ -151,7 +199,18 @@ const columns = computed<DataTableColumns<ExternalApp>>(() => [
 async function loadApps() {
   loading.value = true;
   try {
-    apps.value = await apiRequest<ExternalApp[]>("/api/v1/admin/external-apps");
+    const [appList, userList, roleList] = await Promise.all([
+      apiRequest<ExternalApp[]>("/api/v1/admin/external-apps"),
+      auth.hasPermission("user:read")
+        ? apiRequest<UserItem[]>("/api/v1/admin/users")
+        : Promise.resolve([]),
+      auth.hasPermission("external_role:read")
+        ? apiRequest<ExternalRole[]>("/api/v1/admin/external-roles")
+        : Promise.resolve([]),
+    ]);
+    apps.value = appList;
+    allUsers.value = userList;
+    allExternalRoles.value = roleList;
   } catch (err: any) {
     message.error(err?.detail || "加载失败");
   } finally {
@@ -166,6 +225,8 @@ function openCreate() {
     name: "",
     description: "",
     user_identity_header: "X-FieldScope-User",
+    allowed_user_ids: [],
+    allowed_external_role_ids: [],
     is_active: true,
   });
   showForm.value = true;
@@ -178,6 +239,8 @@ function openEdit(row: ExternalApp) {
     name: row.name,
     description: row.description,
     user_identity_header: row.user_identity_header,
+    allowed_user_ids: [...(row.allowed_user_ids || [])],
+    allowed_external_role_ids: [...(row.allowed_external_role_ids || [])],
     is_active: row.is_active,
   });
   showForm.value = true;
@@ -193,6 +256,8 @@ async function handleSave() {
           name: form.name,
           description: form.description,
           user_identity_header: form.user_identity_header,
+          allowed_user_ids: form.allowed_user_ids,
+          allowed_external_role_ids: form.allowed_external_role_ids,
           is_active: form.is_active,
         },
       });

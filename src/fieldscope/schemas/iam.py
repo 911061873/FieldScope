@@ -131,6 +131,8 @@ class ExternalAppCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     description: str = ""
     user_identity_header: str = Field(default="X-FieldScope-User", min_length=1, max_length=64)
+    allowed_user_ids: list[int] = Field(default_factory=list)
+    allowed_external_role_ids: list[int] = Field(default_factory=list)
     is_active: bool = True
 
 
@@ -138,6 +140,8 @@ class ExternalAppUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     description: str | None = None
     user_identity_header: str | None = Field(default=None, min_length=1, max_length=64)
+    allowed_user_ids: list[int] | None = None
+    allowed_external_role_ids: list[int] | None = None
     is_active: bool | None = None
 
 
@@ -148,6 +152,8 @@ class ExternalAppRead(BaseModel):
     description: str
     key_prefix: str
     user_identity_header: str
+    allowed_user_ids: list[int] = Field(default_factory=list)
+    allowed_external_role_ids: list[int] = Field(default_factory=list)
     last_used_at: datetime | None
     is_active: bool
     created_at: datetime

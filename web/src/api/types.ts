@@ -71,6 +71,8 @@ export interface ExternalApp {
   description: string;
   key_prefix: string;
   user_identity_header: string;
+  allowed_user_ids: number[];
+  allowed_external_role_ids: number[];
   last_used_at: string | null;
   is_active: boolean;
   created_at: string;
@@ -103,7 +105,7 @@ export interface PlatformItem {
   description: string;
   protocol_type: "api" | "mcp";
   base_url: string;
-  mcp_transport: "streamable_http" | "sse" | null;
+  mcp_transport: "streamable_http" | null;
   timeout_ms: number;
   extra_headers: Record<string, string>;
   is_active: boolean;

@@ -191,6 +191,9 @@
             placeholder='[{"path": "data.items[*].phone", "action": "mask_phone"}]'
           />
         </n-form-item>
+        <n-form-item label="启用该策略" label-placement="left">
+          <n-switch v-model:value="policyForm.is_active" />
+        </n-form-item>
       </n-form>
 
       <template #footer>
@@ -262,6 +265,7 @@ const policyForm = reactive({
   fieldMode: "allowlist" as "none" | "allowlist" | "denylist",
   fieldsText: "",
   transformsJson: "[]",
+  is_active: true,
 });
 
 const platformMap = computed(() => {
@@ -364,6 +368,15 @@ const policyColumns = computed<DataTableColumns<ExternalPolicy>>(() => [
       r.field_rules
         ? `${r.field_rules.mode} (${r.field_rules.fields?.length || 0})`
         : "不限制",
+  },
+  {
+    title: "状态",
+    key: "is_active",
+    width: 75,
+    render: (r) =>
+      h(NTag, { size: "small", type: r.is_active ? "success" : "default", bordered: false }, () =>
+        r.is_active ? "启用" : "停用"
+      ),
   },
   {
     title: "操作",
@@ -477,6 +490,7 @@ function openCreatePolicy() {
     fieldMode: "allowlist",
     fieldsText: "",
     transformsJson: "[]",
+    is_active: true,
   });
   showPolicyModal.value = true;
 }
@@ -496,6 +510,7 @@ function openEditPolicy(pol: ExternalPolicy) {
     fieldMode: pol.field_rules ? pol.field_rules.mode : "none",
     fieldsText: (pol.field_rules?.fields || []).join("\n"),
     transformsJson: JSON.stringify(pol.field_rules?.transforms || [], null, 2),
+    is_active: pol.is_active,
   });
   showPolicyModal.value = true;
 }
@@ -543,7 +558,7 @@ async function handleSavePolicy() {
     request_rules: { validate: validateArr, enforce: enforceObj },
     row_filter: rowFilter,
     field_rules: fieldRules,
-    is_active: true,
+    is_active: policyForm.is_active,
   };
 
   savingPolicy.value = true;

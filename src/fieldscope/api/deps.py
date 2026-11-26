@@ -109,6 +109,7 @@ async def resolve_data_plane_principal(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
 ) -> DataPlanePrincipal:
     """Resolve data-plane caller via User API Key (fs_usr_*) or External App Key (fs_app_*)."""
     if credentials is None or credentials.scheme.lower() != "bearer":
@@ -119,6 +120,7 @@ async def resolve_data_plane_principal(
 
     raw_key = credentials.credentials.strip()
     now = utc_now()
+    debounce = max(0, settings.last_used_debounce_seconds)
 
     if raw_key.startswith(USER_API_KEY_PREFIX):
         key_hash = hash_api_key(raw_key)
@@ -144,8 +146,12 @@ async def resolve_data_plane_principal(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Associated user is inactive",
             )
-        api_key.last_used_at = now
-        await db.commit()
+        if (
+            api_key.last_used_at is None
+            or (now - api_key.last_used_at).total_seconds() >= debounce
+        ):
+            api_key.last_used_at = now
+            await db.commit()
         return DataPlanePrincipal(auth_mode="user_api_key", user=api_key.user, app=None)
 
     if raw_key.startswith(APP_API_KEY_PREFIX):
@@ -165,15 +171,13 @@ async def resolve_data_plane_principal(
             )
         user_ident = user_ident.strip()
 
-        stmt = select(User).where(User.username == user_ident).options(
-            selectinload(User.external_roles)
+        # Match delegated identity strictly by username to avoid numeric-ID ambiguity
+        stmt = (
+            select(User)
+            .where(User.username == user_ident)
+            .options(selectinload(User.external_roles))
         )
         user = await db.scalar(stmt)
-        if user is None and user_ident.isdigit():
-            stmt_by_id = select(User).where(User.id == int(user_ident)).options(
-                selectinload(User.external_roles)
-            )
-            user = await db.scalar(stmt_by_id)
 
         if user is None or not user.is_active:
             raise HTTPException(
@@ -181,8 +185,23 @@ async def resolve_data_plane_principal(
                 detail=f"Delegated user '{user_ident}' not found or inactive",
             )
 
-        app.last_used_at = now
-        await db.commit()
+        # Enforce delegation scope if allowed_user_ids or allowed_external_role_ids is configured
+        allowed_uids = set(app.allowed_user_ids or [])
+        allowed_rids = set(app.allowed_external_role_ids or [])
+        if allowed_uids or allowed_rids:
+            user_active_rids = {r.id for r in user.external_roles if r.is_active}
+            if user.id not in allowed_uids and not (user_active_rids & allowed_rids):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        f"External app '{app.app_code}' is not permitted to delegate "
+                        f"user '{user.username}'"
+                    ),
+                )
+
+        if app.last_used_at is None or (now - app.last_used_at).total_seconds() >= debounce:
+            app.last_used_at = now
+            await db.commit()
         return DataPlanePrincipal(auth_mode="external_app_delegation", user=user, app=app)
 
     raise HTTPException(
