@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -13,20 +14,29 @@ from fieldscope.api.routers import (
     external_apps,
     external_roles,
     health,
+    platform_auth,
     platform_roles,
     platforms,
     users,
 )
+from fieldscope.auth_engine.cache import TokenCacheBackend
+from fieldscope.auth_engine.engine import AuthEngine
 from fieldscope.core.config import Settings, get_settings
 from fieldscope.core.crypto import SecretCipher
 from fieldscope.db.seed import seed_initial_data
 from fieldscope.db.session import DatabaseManager
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    http_client: httpx.AsyncClient | None = None,
+    token_cache: TokenCacheBackend | None = None,
+) -> FastAPI:
     cfg = settings or get_settings()
     db_manager = DatabaseManager(cfg.database_url, echo=cfg.debug)
     cipher = SecretCipher(cfg.encryption_key)
+    auth_engine = AuthEngine(cipher=cipher, cache=token_cache, http_client=http_client)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -47,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = cfg
     app.state.db = db_manager
     app.state.cipher = cipher
+    app.state.auth_engine = auth_engine
 
     app.add_middleware(
         CORSMiddleware,
@@ -63,6 +74,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(users.router)
     app.include_router(external_apps.router)
     app.include_router(platforms.router)
+    app.include_router(platform_auth.router)
     app.include_router(external_roles.router)
 
     # Serve compiled Vue 3 + Naive UI SPA when present (Phase 4 unified deployment)
