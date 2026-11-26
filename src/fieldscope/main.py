@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from fieldscope.api.routers import (
+    audit,
     auth,
     external_apps,
     external_roles,
@@ -25,6 +26,8 @@ from fieldscope.core.config import Settings, get_settings
 from fieldscope.core.crypto import SecretCipher
 from fieldscope.db.seed import seed_initial_data
 from fieldscope.db.session import DatabaseManager
+from fieldscope.gateway import router as gateway_router
+from fieldscope.gateway.pipeline import GatewayPipeline
 
 
 def create_app(
@@ -37,6 +40,7 @@ def create_app(
     db_manager = DatabaseManager(cfg.database_url, echo=cfg.debug)
     cipher = SecretCipher(cfg.encryption_key)
     auth_engine = AuthEngine(cipher=cipher, cache=token_cache, http_client=http_client)
+    gateway_pipeline = GatewayPipeline(auth_engine=auth_engine)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -58,6 +62,7 @@ def create_app(
     app.state.db = db_manager
     app.state.cipher = cipher
     app.state.auth_engine = auth_engine
+    app.state.gateway_pipeline = gateway_pipeline
 
     app.add_middleware(
         CORSMiddleware,
@@ -76,6 +81,10 @@ def create_app(
     app.include_router(platforms.router)
     app.include_router(platform_auth.router)
     app.include_router(external_roles.router)
+    app.include_router(audit.router)
+
+    # Data-plane routers (/gateway/{platform}/* & /mcp)
+    app.include_router(gateway_router.router)
 
     # Serve compiled Vue 3 + Naive UI SPA when present (Phase 4 unified deployment)
     static_dir = cfg.resolved_static_dir

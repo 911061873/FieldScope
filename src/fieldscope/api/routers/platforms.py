@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from fieldscope.api.deps import require_permissions
+from fieldscope.auth_engine.engine import AuthEngine, AuthEngineError
+from fieldscope.connectors.mcp_upstream import UpstreamMcpClient, UpstreamMcpError
 from fieldscope.db.models import Platform, PlatformEndpoint, User
 from fieldscope.db.session import get_db
 from fieldscope.schemas.common import MessageResponse
@@ -251,3 +253,73 @@ async def delete_platform_endpoint(
     await db.delete(endpoint)
     await db.commit()
     return MessageResponse(message="Endpoint deleted")
+
+
+@router.post("/{platform_id}/sync-mcp-tools", response_model=list[PlatformEndpointRead])
+async def sync_upstream_mcp_tools(
+    platform_id: int,
+    request: Request,
+    _admin: User = Depends(require_permissions("platform:write")),
+    db: AsyncSession = Depends(get_db),
+) -> list[PlatformEndpointRead]:
+    """Fetch tools/list from a remote MCP platform and upsert them as managed endpoints."""
+    platform = await _load_platform(db, platform_id)
+    if platform is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Platform not found")
+    if platform.protocol_type != "mcp":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only MCP platforms support syncing upstream MCP tools",
+        )
+
+    auth_engine: AuthEngine = request.app.state.auth_engine
+    mcp_client = UpstreamMcpClient(auth_engine)
+    try:
+        upstream_tools = await mcp_client.list_tools(db, platform)
+    except (AuthEngineError, UpstreamMcpError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to sync upstream MCP tools: {exc}",
+        ) from exc
+
+    existing_by_code = {ep.code: ep for ep in platform.endpoints}
+    for tool in upstream_tools:
+        tool_code = str(tool["name"])
+        tool_desc = str(tool.get("description") or "")
+        input_schema = tool.get("inputSchema") or {"type": "object", "properties": {}}
+        exposed_name = f"{platform.code}_{tool_code}"
+
+        ep = existing_by_code.get(tool_code)
+        if ep is None:
+            ep = PlatformEndpoint(
+                platform_id=platform.id,
+                resource_type="mcp_tool",
+                code=tool_code,
+                name=tool_code,
+                description=tool_desc,
+                method=None,
+                path_pattern=None,
+                expose_as_mcp=True,
+                mcp_tool_name=exposed_name,
+                input_schema=input_schema,
+                output_schema={},
+                is_active=True,
+            )
+            db.add(ep)
+        else:
+            ep.resource_type = "mcp_tool"
+            ep.description = tool_desc
+            ep.input_schema = input_schema
+            if not ep.mcp_tool_name:
+                ep.mcp_tool_name = exposed_name
+
+    await db.commit()
+    rows = (
+        await db.scalars(
+            select(PlatformEndpoint)
+            .where(PlatformEndpoint.platform_id == platform_id)
+            .order_by(PlatformEndpoint.id.asc())
+        )
+    ).all()
+    return [PlatformEndpointRead.model_validate(e) for e in rows]
+
