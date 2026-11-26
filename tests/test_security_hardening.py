@@ -804,3 +804,127 @@ async def test_rotating_refresh_token_and_single_use_oauth_state() -> None:
 
         # Must have used the latest DB refresh_token "rt-v2", NOT stale cached "rt-v1"!
         assert seen_refresh_tokens == ["rt-v2"]
+
+
+@pytest.mark.asyncio
+async def test_rest_to_mcp_four_slot_param_routing() -> None:
+    captured: list[httpx.Request] = []
+
+    def mock_upstream(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"created": True})
+
+    async with _sec_client(mock_upstream) as (c, _app):
+        admin_h = await login_and_get_headers(c)
+        pid = (
+            await c.post(
+                "/api/v1/admin/platforms",
+                headers=admin_h,
+                json={"code": "ord", "name": "Orders", "base_url": "https://ord.local"},
+            )
+        ).json()["id"]
+        await c.put(
+            f"/api/v1/admin/platforms/{pid}/auth",
+            headers=admin_h,
+            json={
+                "auth_type": "static",
+                "location": "header",
+                "param_name": "Authorization",
+                "value": "real-platform-secret",
+                "value_prefix": "Bearer ",
+            },
+        )
+        ep_id = (
+            await c.post(
+                f"/api/v1/admin/platforms/{pid}/endpoints",
+                headers=admin_h,
+                json={
+                    "code": "create_order",
+                    "name": "Create Order",
+                    "method": "POST",
+                    "path_pattern": "/api/v1/orgs/{org_id}/orders",
+                    "expose_as_mcp": True,
+                    "mcp_tool_name": "ord_create_order",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "org_id": {"type": "string", "x-in": "path"},
+                            "dry_run": {"type": "boolean", "x-in": "query"},
+                            "X-Locale": {"type": "string", "x-in": "header"},
+                            "Authorization": {"type": "string", "x-in": "header"},
+                            "title": {"type": "string", "x-in": "body"},
+                        },
+                        "required": ["org_id", "title"],
+                    },
+                },
+            )
+        ).json()["id"]
+
+        rid = (
+            await c.post(
+                "/api/v1/admin/external-roles", headers=admin_h, json={"code": "ord_r", "name": "R"}
+            )
+        ).json()["id"]
+        await c.post(
+            f"/api/v1/admin/external-roles/{rid}/policies",
+            headers=admin_h,
+            json={"platform_id": pid, "endpoint_id": ep_id},
+        )
+        uid = (
+            await c.post(
+                "/api/v1/admin/users",
+                headers=admin_h,
+                json={
+                    "username": "ord_user",
+                    "password": "Password123!",
+                    "external_role_ids": [rid],
+                },
+            )
+        ).json()["id"]
+        ukey = (
+            await c.post(f"/api/v1/admin/users/{uid}/api-keys", headers=admin_h, json={"name": "k"})
+        ).json()["plain_key"]
+        uh = {"Authorization": f"Bearer {ukey}"}
+
+        # tools/list strips internal x-in annotations for strict MCP clients
+        tools = (
+            await c.post(
+                "/mcp",
+                headers=uh,
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            )
+        ).json()["result"]["tools"]
+        schema_props = tools[0]["inputSchema"]["properties"]
+        assert "x-in" not in schema_props["org_id"]
+        assert "x-in" not in schema_props["dry_run"]
+
+        # tools/call routes each parameter to path / query / header / body;
+        # spoofed Authorization header is ignored in favor of platform credentials
+        res = await c.post(
+            "/mcp",
+            headers=uh,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "ord_create_order",
+                    "arguments": {
+                        "org_id": "acme",
+                        "dry_run": True,
+                        "X-Locale": "zh-CN",
+                        "Authorization": "Bearer spoofed",
+                        "title": "New Deal",
+                    },
+                },
+            },
+        )
+        assert res.status_code == 200
+        assert "result" in res.json()
+        req = captured[-1]
+        assert req.url.path == "/api/v1/orgs/acme/orders"
+        assert req.url.params.get("dry_run") == "true"
+        assert req.headers.get("X-Locale") == "zh-CN"
+        assert req.headers.get("Authorization") == "Bearer real-platform-secret"
+        assert json.loads(req.content.decode()) == {"title": "New Deal"}
+

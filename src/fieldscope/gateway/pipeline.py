@@ -209,6 +209,71 @@ def _extract_path_param_names(pattern: str) -> set[str]:
     return {m.group(1) or m.group(2) for m in _PATH_PARAM_RE.finditer(pattern)}
 
 
+def _sanitize_mcp_input_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a clean JSON Schema for MCP clients without internal x-in routing hints."""
+    if not isinstance(schema, dict) or not schema:
+        return {"type": "object", "properties": {}}
+    cleaned = dict(schema)
+    raw_props = schema.get("properties")
+    if isinstance(raw_props, dict):
+        clean_props: dict[str, Any] = {}
+        for k, v in raw_props.items():
+            if isinstance(v, dict):
+                clean_props[k] = {pk: pv for pk, pv in v.items() if pk != "x-in"}
+            else:
+                clean_props[k] = v
+        cleaned["properties"] = clean_props
+    return cleaned
+
+
+def _partition_rest_mcp_args(
+    *,
+    pattern: str,
+    method: str,
+    input_schema: dict[str, Any] | None,
+    args: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str], dict[str, Any]]:
+    """Split REST-to-MCP arguments into (path, query, header, body) using schema x-in hints."""
+    path_param_names = _extract_path_param_names(pattern)
+    props = (
+        input_schema.get("properties")
+        if isinstance(input_schema, dict) and isinstance(input_schema.get("properties"), dict)
+        else {}
+    )
+
+    path_params: dict[str, Any] = {}
+    query_params: dict[str, Any] = {}
+    header_params: dict[str, str] = {}
+    body_params: dict[str, Any] = {}
+
+    for key, val in args.items():
+        prop_def = props.get(key) if isinstance(props, dict) else None
+        hint = prop_def.get("x-in") if isinstance(prop_def, dict) else None
+
+        if key in path_param_names or hint == "path":
+            path_params[key] = val
+        elif hint == "query":
+            query_params[key] = val
+        elif hint == "header":
+            if key.lower() in _STRIPPED_REQUEST_HEADERS:
+                continue
+            str_val = str(val)
+            if "\r" in str_val or "\n" in str_val:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid header parameter value for '{key}'",
+                )
+            header_params[key] = str_val
+        elif hint == "body":
+            body_params[key] = val
+        elif method in ("GET", "DELETE"):
+            query_params[key] = val
+        else:
+            body_params[key] = val
+
+    return path_params, query_params, header_params, body_params
+
+
 def _extract_safe_response_headers(response: httpx.Response) -> dict[str, str]:
     safe: dict[str, str] = {}
     for k, v in response.headers.items():
@@ -599,7 +664,7 @@ class GatewayPipeline:
                 if not decision.allowed:
                     continue
                 tool_name = ep.mcp_tool_name or f"{platform.code}_{ep.code}"
-                schema = ep.input_schema or {"type": "object", "properties": {}}
+                schema = _sanitize_mcp_input_schema(ep.input_schema)
                 visible_tools.append(
                     {
                         "name": tool_name,
@@ -728,23 +793,26 @@ class GatewayPipeline:
                     self._govern_mcp_result(raw_mcp_result, decision, principal)
                 )
             else:
-                # REST-to-MCP execution
+                # REST-to-MCP execution (supports path / query / header / body routing via x-in)
                 method = (target_ep.method or "GET").upper()
                 pattern = target_ep.path_pattern or "/"
-                path_param_names = _extract_path_param_names(pattern)
-                path_params = {k: enforced_args[k] for k in path_param_names if k in enforced_args}
-                remaining = {k: v for k, v in enforced_args.items() if k not in path_param_names}
+                path_params, mcp_query, mcp_headers, mcp_body = _partition_rest_mcp_args(
+                    pattern=pattern,
+                    method=method,
+                    input_schema=target_ep.input_schema,
+                    args=enforced_args,
+                )
                 rendered_path = render_path_pattern(pattern, path_params)
                 target_url = f"{platform.base_url}{rendered_path}"
 
                 async def _send(injection: AuthInjection) -> httpx.Response:
-                    req_headers = {**platform.extra_headers, **injection.headers}
-                    if method in ("GET", "DELETE"):
-                        req_query = {**remaining, **injection.query_params}
-                        req_body = None
-                    else:
-                        req_query = dict(injection.query_params)
-                        req_body = remaining
+                    req_headers = {**mcp_headers, **platform.extra_headers, **injection.headers}
+                    req_query = {**mcp_query, **injection.query_params}
+                    req_body = (
+                        mcp_body
+                        if (mcp_body or method not in ("GET", "DELETE"))
+                        else None
+                    )
                     return await self._auth_engine.send_http_request(
                         method,
                         target_url,

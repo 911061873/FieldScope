@@ -2,64 +2,84 @@
   <div class="schema-editor">
     <div class="editor-header">
       <div>
-        <div class="editor-title">入参定义（JSON Schema）</div>
+        <div class="editor-title">接口入参配置</div>
         <div class="editor-hint">
           <template v-if="isMcpTool">
-            定义 MCP Tool 的入参结构，AI 将按此说明填充调用参数。
+            配置 MCP Tool 入参结构，供 AI 调用时按字段说明传参。
           </template>
           <template v-else>
-            供 AI / MCP 调用时识别参数；与路径中 <code>{参数}</code> 同名将填入路径，其余自动作为
-            {{ isBodyMethod ? "JSON Body" : "Query 参数" }}。
+            按路径参数、查询参数、请求头、请求体分组定义入参，对外暴露为 MCP 工具时自动路由到对应位置。
           </template>
         </div>
       </div>
-      <n-space :size="6" align="center">
-        <n-button
-          v-if="editMode === 'visual' && missingPathParams.length > 0"
-          size="tiny"
-          secondary
-          type="primary"
-          @click="importPathParams"
-        >
-          提取路径参数 ({{ missingPathParams.length }})
-        </n-button>
-        <n-radio-group v-model:value="editMode" size="small" @update:value="onModeChange">
-          <n-radio-button value="visual">可视化</n-radio-button>
-          <n-radio-button value="json">JSON</n-radio-button>
-        </n-radio-group>
-      </n-space>
+      <n-radio-group v-model:value="editMode" size="small" @update:value="onModeChange">
+        <n-radio-button value="visual">可视化</n-radio-button>
+        <n-radio-button value="json">JSON Schema</n-radio-button>
+      </n-radio-group>
     </div>
 
     <!-- Visual Mode -->
     <div v-if="editMode === 'visual'" class="editor-body">
+      <!-- 4-tab HTTP param layout -->
+      <template v-if="!isMcpTool">
+        <n-tabs v-model:value="activeTab" type="segment" size="small" animated>
+          <n-tab-pane name="path" :tab="tabLabel('路径参数', countByLoc.path)" />
+          <n-tab-pane name="query" :tab="tabLabel('查询参数', countByLoc.query)" />
+          <n-tab-pane name="header" :tab="tabLabel('请求头', countByLoc.header)" />
+          <n-tab-pane name="body" :tab="tabLabel('请求体', countByLoc.body)" />
+        </n-tabs>
+
+        <!-- Contextual helper bar per tab -->
+        <div v-if="activeTab === 'path' && missingPathParams.length > 0" class="sync-banner">
+          <span>
+            路径模板中检测到未添加的参数：
+            <code v-for="p in missingPathParams" :key="p" class="mono-chip">{{ p }}</code>
+          </span>
+          <n-button size="tiny" type="primary" secondary @click="importPathParams">
+            一键提取
+          </n-button>
+        </div>
+
+        <div v-if="activeTab === 'header'" class="subtle-tip">
+          平台级认证 Header（如 Authorization / API Key）由「认证与续期」自动注入，此处仅配置接口级动态请求头。
+        </div>
+
+        <div
+          v-if="activeTab === 'body' && !isBodyMethod"
+          class="subtle-tip"
+        >
+          当前 HTTP 方法为 <b>{{ httpMethod }}</b>，通常使用「查询参数」而非「请求体」。
+        </div>
+      </template>
+
+      <!-- Action bar for current group -->
       <div class="section-bar">
-        <span class="section-label">参数列表（共 {{ rows.length }} 个）</span>
-        <n-button size="tiny" dashed type="primary" @click="addRow">+ 添加参数</n-button>
+        <span class="section-label">
+          {{ isMcpTool ? `参数列表（${visibleRows.length}）` : `${currentTabTitle}（${visibleRows.length}）` }}
+        </span>
+        <n-button size="tiny" dashed type="primary" @click="addRow">
+          + 添加{{ isMcpTool ? "参数" : currentTabShortName }}
+        </n-button>
       </div>
 
-      <div v-if="rows.length === 0" class="empty-tip">
-        暂无入参定义（仅走 HTTP 代理或无参接口可留空；暴露给 AI / MCP 时建议补充参数说明）。
+      <div v-if="duplicateNames.length > 0" class="inline-error">
+        存在重复参数名（{{ duplicateNames.join("、") }}），同一接口的各分组参数名需保持唯一。
       </div>
 
-      <div v-for="(row, idx) in rows" :key="row.uid" class="param-card">
+      <div v-if="visibleRows.length === 0" class="empty-tip">
+        {{ emptyTipText }}
+      </div>
+
+      <!-- Compact parameter rows -->
+      <div v-for="row in visibleRows" :key="row.uid" class="param-card">
         <div class="param-top-grid">
           <div class="field-col">
-            <div class="mini-label-row">
-              <span class="mini-label">参数名</span>
-              <n-tag
-                v-if="!isMcpTool && row.name.trim()"
-                size="tiny"
-                :type="getParamLocation(row.name.trim()) === 'Path' ? 'success' : 'info'"
-                :bordered="false"
-              >
-                {{ getParamLocation(row.name.trim()) }}
-              </n-tag>
-            </div>
+            <div class="mini-label">参数名</div>
             <n-input
               v-model:value="row.name"
               size="small"
               class="mono-code"
-              placeholder="例如 id / limit / status"
+              :placeholder="namePlaceholder"
               @update:value="emitVisualValue"
             />
           </div>
@@ -69,20 +89,22 @@
             <n-select
               v-model:value="row.type"
               size="small"
-              :options="typeOptions"
+              :options="typeOptionsForLocation(row.location)"
               @update:value="onTypeChange(row)"
             />
           </div>
 
           <div class="field-col field-req">
             <div class="mini-label">必填</div>
-            <div style="height: 28px; display: flex; align-items: center">
+            <div class="req-box">
               <n-checkbox v-model:checked="row.required" @update:checked="emitVisualValue" />
             </div>
           </div>
 
           <div class="field-col field-actions">
-            <n-button size="tiny" quaternary type="error" @click="removeRow(idx)">删除</n-button>
+            <n-button size="tiny" quaternary type="error" @click="removeRowByUid(row.uid)">
+              删除
+            </n-button>
           </div>
         </div>
 
@@ -90,7 +112,7 @@
           <n-input
             v-model:value="row.description"
             size="small"
-            placeholder="参数说明（给 AI 看，例如：客户 ID / 每页条数，最大 50）"
+            placeholder="参数说明（供 AI 理解用途，如：客户 ID / 每页数量，最大 50）"
             @update:value="emitVisualValue"
           />
         </div>
@@ -99,7 +121,7 @@
           v-if="row.type === 'string' || row.type === 'integer' || row.type === 'number'"
           class="param-enum-row"
         >
-          <span class="mini-label" style="white-space: nowrap">枚举值（可选）</span>
+          <span class="mini-label" style="white-space: nowrap">可选枚举</span>
           <n-dynamic-tags
             v-model:value="row.enumTags"
             size="small"
@@ -109,12 +131,12 @@
       </div>
     </div>
 
-    <!-- JSON Advanced Mode -->
+    <!-- JSON Schema Advanced Mode -->
     <div v-else class="editor-body">
       <n-input
         v-model:value="rawJsonText"
         type="textarea"
-        :rows="7"
+        :rows="8"
         class="mono-code"
         placeholder='{"type": "object", "properties": {}, "required": []}'
         @update:value="onRawJsonInput"
@@ -134,14 +156,16 @@ import {
   NRadioButton,
   NRadioGroup,
   NSelect,
-  NSpace,
-  NTag,
+  NTabPane,
+  NTabs,
 } from "naive-ui";
 
+type ParamLocation = "path" | "query" | "header" | "body";
 type JsonSchemaType = "string" | "integer" | "number" | "boolean" | "array" | "object";
 
 interface ParamRow {
   uid: number;
+  location: ParamLocation;
   name: string;
   type: JsonSchemaType;
   description: string;
@@ -170,7 +194,7 @@ const emit = defineEmits<{
   (e: "validChange", valid: boolean): void;
 }>();
 
-const typeOptions = [
+const allTypeOptions = [
   { label: "string", value: "string" },
   { label: "integer", value: "integer" },
   { label: "number", value: "number" },
@@ -179,8 +203,15 @@ const typeOptions = [
   { label: "object", value: "object" },
 ];
 
+const scalarTypeOptions = allTypeOptions.filter((o) =>
+  ["string", "integer", "number", "boolean"].includes(o.value)
+);
+
+const queryTypeOptions = allTypeOptions.filter((o) => o.value !== "object");
+
 let nextUid = 1;
 const editMode = ref<"visual" | "json">("visual");
+const activeTab = ref<ParamLocation>("query");
 const rows = ref<ParamRow[]>([]);
 const rootExtra = ref<Record<string, unknown>>({});
 const rawJsonText = ref("");
@@ -205,13 +236,90 @@ const pathParamNames = computed(() => {
 
 const missingPathParams = computed(() => {
   if (props.isMcpTool) return [];
-  const existing = new Set(rows.value.map((r) => r.name.trim()).filter(Boolean));
+  const existing = new Set(
+    rows.value
+      .filter((r) => r.location === "path")
+      .map((r) => r.name.trim())
+      .filter(Boolean)
+  );
   return Array.from(pathParamNames.value).filter((name) => !existing.has(name));
 });
 
-function getParamLocation(name: string): "Path" | "Query" | "Body" {
-  if (pathParamNames.value.has(name)) return "Path";
-  return isBodyMethod.value ? "Body" : "Query";
+const countByLoc = computed(() => {
+  const counts: Record<ParamLocation, number> = { path: 0, query: 0, header: 0, body: 0 };
+  for (const r of rows.value) {
+    counts[r.location] += 1;
+  }
+  return counts;
+});
+
+const visibleRows = computed(() => {
+  if (props.isMcpTool) return rows.value;
+  return rows.value.filter((r) => r.location === activeTab.value);
+});
+
+const duplicateNames = computed(() => {
+  const seen = new Set<string>();
+  const dups = new Set<string>();
+  for (const r of rows.value) {
+    const name = r.name.trim();
+    if (!name) continue;
+    if (seen.has(name)) dups.add(name);
+    seen.add(name);
+  }
+  return Array.from(dups);
+});
+
+const currentTabTitle = computed(() => {
+  const map: Record<ParamLocation, string> = {
+    path: "路径参数（替换路径中的 {param}）",
+    query: "查询参数（URL ?key=value）",
+    header: "请求头（HTTP Headers）",
+    body: "请求体字段（JSON Body）",
+  };
+  return map[activeTab.value];
+});
+
+const currentTabShortName = computed(() => {
+  const map: Record<ParamLocation, string> = {
+    path: "路径参数",
+    query: "查询参数",
+    header: "请求头",
+    body: "Body 字段",
+  };
+  return map[activeTab.value];
+});
+
+const namePlaceholder = computed(() => {
+  if (props.isMcpTool) return "例如 dept / keyword";
+  const map: Record<ParamLocation, string> = {
+    path: "例如 id / key",
+    query: "例如 limit / status / keyword",
+    header: "例如 X-Locale / X-Tenant-Id",
+    body: "例如 title / customer_id",
+  };
+  return map[activeTab.value];
+});
+
+const emptyTipText = computed(() => {
+  if (props.isMcpTool) return "暂无参数定义，点击右上角「+ 添加参数」新增。";
+  const map: Record<ParamLocation, string> = {
+    path: "暂无路径参数。若路径模板含 {id}，可点击上方「一键提取」或手动添加。",
+    query: "暂无查询参数，点击右上角「+ 添加查询参数」新增。",
+    header: "暂无自定义请求头（平台认证头会自动注入，无需在此添加）。",
+    body: "暂无请求体字段，点击右上角「+ 添加 Body 字段」新增。",
+  };
+  return map[activeTab.value];
+});
+
+function tabLabel(title: string, count: number): string {
+  return count > 0 ? `${title} (${count})` : title;
+}
+
+function typeOptionsForLocation(loc: ParamLocation) {
+  if (props.isMcpTool || loc === "body") return allTypeOptions;
+  if (loc === "query") return queryTypeOptions;
+  return scalarTypeOptions;
 }
 
 function normalizeSchemaType(raw: unknown): JsonSchemaType {
@@ -222,7 +330,26 @@ function normalizeSchemaType(raw: unknown): JsonSchemaType {
   return "string";
 }
 
-function syncFromProps(schema: Record<string, unknown>) {
+function normalizeLocation(raw: unknown, name: string): ParamLocation {
+  if (raw === "path" || raw === "query" || raw === "header" || raw === "body") {
+    return raw;
+  }
+  if (pathParamNames.value.has(name)) return "path";
+  return isBodyMethod.value ? "body" : "query";
+}
+
+function pickInitialTab() {
+  if (props.isMcpTool) return;
+  if (countByLoc.value.path > 0 || pathParamNames.value.size > 0) {
+    activeTab.value = "path";
+  } else if (isBodyMethod.value) {
+    activeTab.value = "body";
+  } else {
+    activeTab.value = "query";
+  }
+}
+
+function syncFromProps(schema: Record<string, unknown>, resetTab = false) {
   const safe = schema && typeof schema === "object" && !Array.isArray(schema) ? schema : {};
   const { type: _t, properties: rawProps, required: rawReq, ...restRoot } = safe;
   rootExtra.value = JSON.parse(JSON.stringify(restRoot));
@@ -240,9 +367,10 @@ function syncFromProps(schema: Record<string, unknown>) {
       rawDef && typeof rawDef === "object" && !Array.isArray(rawDef)
         ? (rawDef as Record<string, unknown>)
         : {};
-    const { type, description, enum: enumVals, ...restProp } = def;
+    const { type, description, enum: enumVals, "x-in": xIn, ...restProp } = def;
     return {
       uid: nextUid++,
+      location: normalizeLocation(xIn, name),
       name,
       type: normalizeSchemaType(type),
       description: typeof description === "string" ? description : "",
@@ -252,6 +380,9 @@ function syncFromProps(schema: Record<string, unknown>) {
     };
   });
 
+  if (resetTab) {
+    pickInitialTab();
+  }
   rawJsonText.value = JSON.stringify(buildSchemaFromRows(), null, 2);
   jsonError.value = "";
   emit("validChange", true);
@@ -281,6 +412,9 @@ function buildSchemaFromRows(): Record<string, unknown> {
       ...row.extra,
       type: row.type,
     };
+    if (!props.isMcpTool) {
+      propDef["x-in"] = row.location;
+    }
     if (row.description.trim()) {
       propDef.description = row.description.trim();
     }
@@ -321,7 +455,7 @@ watch(
       internalSync = false;
       return;
     }
-    syncFromProps(val);
+    syncFromProps(val, true);
   },
   { immediate: true, deep: true }
 );
@@ -340,26 +474,32 @@ function emitVisualValue() {
 }
 
 function addRow() {
+  const loc: ParamLocation = props.isMcpTool ? "body" : activeTab.value;
   rows.value.push({
     uid: nextUid++,
+    location: loc,
     name: "",
     type: "string",
     description: "",
-    required: false,
+    required: loc === "path",
     enumTags: [],
     extra: {},
   });
 }
 
-function removeRow(index: number) {
-  rows.value.splice(index, 1);
-  emitVisualValue();
+function removeRowByUid(uid: number) {
+  const idx = rows.value.findIndex((r) => r.uid === uid);
+  if (idx !== -1) {
+    rows.value.splice(idx, 1);
+    emitVisualValue();
+  }
 }
 
 function importPathParams() {
   for (const name of missingPathParams.value) {
     rows.value.push({
       uid: nextUid++,
+      location: "path",
       name,
       type: "string",
       description: `路径参数 ${name}`,
@@ -395,7 +535,7 @@ function onModeChange(nextMode: "visual" | "json") {
       editMode.value = "json";
       return;
     }
-    syncFromProps(props.modelValue);
+    syncFromProps(props.modelValue, false);
   }
 }
 
@@ -450,6 +590,38 @@ function onRawJsonInput(text: string) {
   gap: 8px;
 }
 
+.sync-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: #0f766e;
+  background: var(--fs-primary-soft);
+  border: 1px solid #99f6e4;
+  border-radius: 6px;
+}
+
+.mono-chip {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  background: #ffffff;
+  border: 1px solid #99f6e4;
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 4px;
+}
+
+.subtle-tip {
+  font-size: 12px;
+  color: var(--fs-text-muted);
+  background: var(--fs-surface);
+  border: 1px solid var(--fs-border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
 .section-bar {
   display: flex;
   align-items: center;
@@ -465,7 +637,7 @@ function onRawJsonInput(text: string) {
 .empty-tip {
   font-size: 12px;
   color: var(--fs-text-muted);
-  padding: 10px 12px;
+  padding: 12px;
   background: var(--fs-surface);
   border: 1px dashed var(--fs-border);
   border-radius: 6px;
@@ -484,7 +656,7 @@ function onRawJsonInput(text: string) {
 
 .param-top-grid {
   display: grid;
-  grid-template-columns: 1fr 112px 46px auto;
+  grid-template-columns: 1fr 112px 44px auto;
   gap: 8px;
   align-items: end;
 }
@@ -499,15 +671,14 @@ function onRawJsonInput(text: string) {
   align-items: center;
 }
 
-.field-actions {
-  padding-bottom: 2px;
-}
-
-.mini-label-row {
+.req-box {
+  height: 28px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 6px;
+}
+
+.field-actions {
+  padding-bottom: 2px;
 }
 
 .mini-label {
@@ -525,6 +696,5 @@ function onRawJsonInput(text: string) {
 .inline-error {
   font-size: 12px;
   color: #dc2626;
-  margin-top: 4px;
 }
 </style>
